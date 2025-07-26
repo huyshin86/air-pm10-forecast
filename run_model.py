@@ -319,16 +319,21 @@ class EnsembleForecaster:
         self.models = models
         self.weights = weights or [1.0 / len(models)] * len(models)
         self.feature_columns = []
+        self.scaler = RobustScaler()
     
     def train(self, X: np.ndarray, y: np.ndarray, feature_columns: List[str]):
         """Train all models in ensemble"""
         
         self.feature_columns = feature_columns
         
+        # Fit scaler on training data
+        self.scaler.fit(X)
+        X_scaled = self.scaler.transform(X)
+        
         for i, model in enumerate(self.models):
             logger.info(f"Training model {i+1}/{len(self.models)}: {model.model_name}")
             try:
-                model.train(X, y)
+                model.train(X_scaled, y)
             except Exception as e:
                 logger.error(f"Failed to train {model.model_name}: {e}")
                 # Set weight to 0 for failed models
@@ -344,13 +349,20 @@ class EnsembleForecaster:
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Make ensemble predictions"""
         
+        # Ensure the input has the same features as training
+        if X.shape[1] != len(self.feature_columns):
+            raise ValueError(f"Input has {X.shape[1]} features, but model was trained with {len(self.feature_columns)} features")
+        
+        # Scale the input data
+        X_scaled = self.scaler.transform(X)
+        
         predictions = []
         valid_weights = []
         
         for model, weight in zip(self.models, self.weights):
             if weight > 0 and model.is_trained:
                 try:
-                    pred = model.predict(X)
+                    pred = model.predict(X_scaled)
                     predictions.append(pred)
                     valid_weights.append(weight)
                 except Exception as e:
@@ -467,20 +479,25 @@ class PM10ForecastingSystem:
             latest_features = features_df.iloc[-1:].copy()
             
             # Update temporal features for forecast time
-            latest_features['hour'] = forecast_time.hour
-            latest_features['day_of_week'] = forecast_time.dayofweek
-            latest_features['month'] = forecast_time.month
-            latest_features['day_of_year'] = forecast_time.dayofyear
+            latest_features.loc[latest_features.index[0], 'hour'] = forecast_time.hour
+            latest_features.loc[latest_features.index[0], 'day_of_week'] = forecast_time.dayofweek
+            latest_features.loc[latest_features.index[0], 'month'] = forecast_time.month
+            latest_features.loc[latest_features.index[0], 'day_of_year'] = forecast_time.dayofyear
             
             # Update cyclical features
-            latest_features['hour_sin'] = np.sin(2 * np.pi * forecast_time.hour / 24)
-            latest_features['hour_cos'] = np.cos(2 * np.pi * forecast_time.hour / 24)
-            latest_features['dow_sin'] = np.sin(2 * np.pi * forecast_time.dayofweek / 7)
-            latest_features['dow_cos'] = np.cos(2 * np.pi * forecast_time.dayofweek / 7)
+            latest_features.loc[latest_features.index[0], 'hour_sin'] = np.sin(2 * np.pi * forecast_time.hour / 24)
+            latest_features.loc[latest_features.index[0], 'hour_cos'] = np.cos(2 * np.pi * forecast_time.hour / 24)
+            latest_features.loc[latest_features.index[0], 'dow_sin'] = np.sin(2 * np.pi * forecast_time.dayofweek / 7)
+            latest_features.loc[latest_features.index[0], 'dow_cos'] = np.cos(2 * np.pi * forecast_time.dayofweek / 7)
             
-            # Prepare feature vector
-            base_forecaster = BaseForecaster("temp")
-            X, _, _ = base_forecaster.prepare_training_data(latest_features)
+            # Ensure we have all required columns, fill missing ones with defaults
+            for col in self.ensemble.feature_columns:
+                if col not in latest_features.columns:
+                    latest_features[col] = 0.0  # Default value for missing features
+            
+            # Extract only the feature columns that were used during training
+            feature_data = latest_features[self.ensemble.feature_columns]
+            X = feature_data.values
             
             # Make prediction
             pm10_pred = self.ensemble.predict(X)[0]
