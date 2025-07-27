@@ -8,7 +8,7 @@ warnings.filterwarnings('ignore')
 
 # Core ML libraries
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.ensemble import RandomForestRegressor
 import lightgbm as lgb
@@ -16,8 +16,15 @@ import catboost as cb
 
 # Neural networks
 try:
+    import tensorflow as tf
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+    tf = None
+    print("TensorFlow not available. LSTM models will not work.")
     from tensorflow.keras.optimizers import Adam
 except ImportError:
     print("TensorFlow not available - LSTM models disabled")
@@ -49,6 +56,45 @@ class DataProcessor:
         except Exception as e:
             logger.error(f"Error loading data: {e}")
             raise
+    
+    def split_cases_temporal(self, cases: List[Dict], train_ratio: float = 0.7, 
+                           valid_ratio: float = 0.15, test_ratio: float = 0.15) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+        """Split cases into train/valid/test based on temporal order"""
+        
+        # Sort cases by prediction start time to maintain temporal order
+        sorted_cases = sorted(cases, key=lambda x: x['target']['prediction_start_time'])
+        
+        n_total = len(sorted_cases)
+        n_train = int(n_total * train_ratio)
+        n_valid = int(n_total * valid_ratio)
+        
+        train_cases = sorted_cases[:n_train]
+        valid_cases = sorted_cases[n_train:n_train + n_valid]
+        test_cases = sorted_cases[n_train + n_valid:]
+        
+        logger.info(f"Temporal split - Train: {len(train_cases)}, Valid: {len(valid_cases)}, Test: {len(test_cases)}")
+        
+        return train_cases, valid_cases, test_cases
+    
+    def split_cases_random(self, cases: List[Dict], train_ratio: float = 0.7, 
+                          valid_ratio: float = 0.15, random_state: int = 42) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+        """Split cases randomly into train/valid/test"""
+        
+        np.random.seed(random_state)
+        shuffled_cases = cases.copy()
+        np.random.shuffle(shuffled_cases)
+        
+        n_total = len(shuffled_cases)
+        n_train = int(n_total * train_ratio)
+        n_valid = int(n_total * valid_ratio)
+        
+        train_cases = shuffled_cases[:n_train]
+        valid_cases = shuffled_cases[n_train:n_train + n_valid]
+        test_cases = shuffled_cases[n_train + n_valid:]
+        
+        logger.info(f"Random split - Train: {len(train_cases)}, Valid: {len(valid_cases)}, Test: {len(test_cases)}")
+        
+        return train_cases, valid_cases, test_cases
     
     def parse_weather_data(self, weather_record: Dict) -> Dict:
         """Parse METAR-style weather data"""
@@ -312,6 +358,87 @@ class RandomForestForecaster(BaseForecaster):
         return self.model.predict(X)
 
 
+class LSTMForecaster(BaseForecaster):
+    """LSTM model with dropout for PM10 forecasting"""
+    
+    def __init__(self, lstm_units: int = 64, dropout_rate: float = 0.3, sequence_length: int = 24, epochs: int = 100):
+        super().__init__("LSTM")
+        self.lstm_units = lstm_units
+        self.dropout_rate = dropout_rate
+        self.sequence_length = sequence_length
+        self.epochs = epochs
+        self.model = None
+        self.scaler = StandardScaler()
+        
+    def fit(self, X: np.ndarray, y: np.ndarray):
+        """Train LSTM model with dropout"""
+        logger.info(f"Training LSTM with {self.lstm_units} units, dropout={self.dropout_rate}")
+        
+        # Scale features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Create sequences for LSTM
+        X_seq, y_seq = self._create_sequences(X_scaled, y)
+        
+        # Build model
+        self.model = tf.keras.Sequential([
+            tf.keras.layers.LSTM(self.lstm_units, return_sequences=True, 
+                               input_shape=(X_seq.shape[1], X_seq.shape[2])),
+            tf.keras.layers.Dropout(self.dropout_rate),
+            tf.keras.layers.LSTM(self.lstm_units // 2, return_sequences=False),
+            tf.keras.layers.Dropout(self.dropout_rate),
+            tf.keras.layers.Dense(32, activation='relu'),
+            tf.keras.layers.Dropout(self.dropout_rate / 2),
+            tf.keras.layers.Dense(1, activation='linear')
+        ])
+        
+        self.model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        
+        # Train model
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=10, restore_best_weights=True
+        )
+        
+        history = self.model.fit(
+            X_seq, y_seq,
+            epochs=self.epochs,
+            batch_size=32,
+            validation_split=0.2,
+            callbacks=[early_stopping],
+            verbose=0
+        )
+        
+        logger.info(f"LSTM training completed. Final loss: {history.history['loss'][-1]:.4f}")
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions using trained LSTM model"""
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        
+        X_scaled = self.scaler.transform(X)
+        X_seq, _ = self._create_sequences(X_scaled, np.zeros(len(X_scaled)))
+        
+        if len(X_seq) == 0:
+            # Fallback for small datasets
+            logger.warning("Not enough data for sequence creation, using last available sequence")
+            # Pad with last known values
+            last_seq = X_scaled[-self.sequence_length:] if len(X_scaled) >= self.sequence_length else np.pad(X_scaled, ((self.sequence_length - len(X_scaled), 0), (0, 0)), 'edge')
+            X_seq = last_seq.reshape(1, self.sequence_length, X_scaled.shape[1])
+            return self.model.predict(X_seq, verbose=0).flatten()
+        
+        return self.model.predict(X_seq, verbose=0).flatten()
+    
+    def _create_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Create sequences for LSTM training"""
+        X_seq, y_seq = [], []
+        
+        for i in range(self.sequence_length, len(X)):
+            X_seq.append(X[i-self.sequence_length:i])
+            y_seq.append(y[i])
+        
+        return np.array(X_seq), np.array(y_seq)
+
+
 class EnsembleForecaster:
     """Ensemble of multiple forecasting models"""
     
@@ -448,6 +575,178 @@ class PM10ForecastingSystem:
         
         logger.info("Model training completed")
     
+    def train_with_validation(self, training_cases: List[Dict], validation_cases: List[Dict] = None, 
+                             include_lstm: bool = True) -> Dict:
+        """Train models with validation and return evaluation metrics"""
+        
+        # Process training data
+        all_features = []
+        all_targets = []
+        
+        logger.info(f"Processing {len(training_cases)} training cases")
+        
+        for case in training_cases:
+            try:
+                features_df, _ = self.data_processor.prepare_case_data(case)
+                
+                # Fill missing weather values with defaults
+                features_df = features_df.fillna({
+                    'humidity': 50.0,
+                    'pressure': 1013.25,
+                    'temperature': 15.0,
+                    'wind_speed': 5.0,
+                    'wind_direction': 180.0
+                })
+                
+                complete_records = features_df.dropna()
+                if len(complete_records) > 0:
+                    all_features.append(complete_records)
+                    
+            except Exception as e:
+                logger.error(f"Error processing training case: {e}")
+                continue
+        
+        if not all_features:
+            raise ValueError("No valid training data available")
+        
+        # Combine all features
+        combined_features = pd.concat(all_features, ignore_index=True)
+        
+        # Prepare training data
+        base_forecaster = BaseForecaster("temp")
+        X_train, y_train, feature_columns = base_forecaster.prepare_training_data(combined_features)
+        
+        logger.info(f"Training data shape: {X_train.shape}, Features: {len(feature_columns)}")
+        
+        # Initialize models
+        models = [
+            LightGBMForecaster(),
+            CatBoostForecaster(),
+            RandomForestForecaster()
+        ]
+        
+        # Add LSTM if TensorFlow is available and requested
+        if include_lstm and TF_AVAILABLE:
+            models.append(LSTMForecaster())
+            logger.info("Added LSTM model with dropout")
+        
+        self.ensemble = EnsembleForecaster(models)
+        self.ensemble.train(X_train, y_train, feature_columns)
+        
+        # Evaluate on validation data if provided
+        validation_metrics = {}
+        if validation_cases:
+            val_features = []
+            val_targets = []
+            
+            logger.info(f"Processing {len(validation_cases)} validation cases")
+            
+            for case in validation_cases:
+                try:
+                    features_df, _ = self.data_processor.prepare_case_data(case)
+                    features_df = features_df.fillna({
+                        'humidity': 50.0,
+                        'pressure': 1013.25,
+                        'temperature': 15.0,
+                        'wind_speed': 5.0,
+                        'wind_direction': 180.0
+                    })
+                    
+                    complete_records = features_df.dropna()
+                    if len(complete_records) > 0:
+                        val_features.append(complete_records)
+                        
+                except Exception as e:
+                    logger.error(f"Error processing validation case: {e}")
+                    continue
+            
+            if val_features:
+                combined_val_features = pd.concat(val_features, ignore_index=True)
+                X_val, y_val, _ = base_forecaster.prepare_training_data(combined_val_features)
+                
+                # Make predictions
+                y_pred = self.ensemble.predict(X_val)
+                
+                # Calculate metrics
+                validation_metrics = {
+                    'mae': float(mean_absolute_error(y_val, y_pred)),
+                    'rmse': float(np.sqrt(mean_squared_error(y_val, y_pred))),
+                    'r2': float(r2_score(y_val, y_pred)),
+                    'mape': float(np.mean(np.abs((y_val - y_pred) / np.maximum(y_val, 1e-8))) * 100)
+                }
+                
+                logger.info(f"Validation Metrics - MAE: {validation_metrics['mae']:.2f}, "
+                          f"RMSE: {validation_metrics['rmse']:.2f}, "
+                          f"R²: {validation_metrics['r2']:.3f}, "
+                          f"MAPE: {validation_metrics['mape']:.2f}%")
+        
+        logger.info("Model training with validation completed")
+        return validation_metrics
+    
+    def evaluate_test_set(self, test_cases: List[Dict]) -> Dict:
+        """Evaluate trained models on test set"""
+        
+        if self.ensemble is None:
+            raise ValueError("Models must be trained before evaluation")
+        
+        # Process test data
+        test_features = []
+        test_targets = []
+        
+        logger.info(f"Processing {len(test_cases)} test cases")
+        
+        for case in test_cases:
+            try:
+                features_df, _ = self.data_processor.prepare_case_data(case)
+                features_df = features_df.fillna({
+                    'humidity': 50.0,
+                    'pressure': 1013.25,
+                    'temperature': 15.0,
+                    'wind_speed': 5.0,
+                    'wind_direction': 180.0
+                })
+                
+                complete_records = features_df.dropna()
+                if len(complete_records) > 0:
+                    test_features.append(complete_records)
+                    
+            except Exception as e:
+                logger.error(f"Error processing test case: {e}")
+                continue
+        
+        if not test_features:
+            raise ValueError("No valid test data available")
+        
+        # Combine all features
+        combined_test_features = pd.concat(test_features, ignore_index=True)
+        
+        # Prepare test data
+        base_forecaster = BaseForecaster("temp")
+        X_test, y_test, _ = base_forecaster.prepare_training_data(combined_test_features)
+        
+        # Make predictions
+        y_pred = self.ensemble.predict(X_test)
+        
+        # Calculate comprehensive metrics
+        test_metrics = {
+            'mae': float(mean_absolute_error(y_test, y_pred)),
+            'rmse': float(np.sqrt(mean_squared_error(y_test, y_pred))),
+            'r2': float(r2_score(y_test, y_pred)),
+            'mape': float(np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 1e-8))) * 100),
+            'samples': len(y_test),
+            'mean_actual': float(np.mean(y_test)),
+            'mean_predicted': float(np.mean(y_pred)),
+            'std_actual': float(np.std(y_test)),
+            'std_predicted': float(np.std(y_pred))
+        }
+        
+        logger.info(f"Test Metrics - MAE: {test_metrics['mae']:.2f}, "
+                   f"RMSE: {test_metrics['rmse']:.2f}, "
+                   f"R²: {test_metrics['r2']:.3f}, "
+                   f"MAPE: {test_metrics['mape']:.2f}%")
+        
+        return test_metrics
+    
     def forecast_case(self, case: Dict) -> List[Dict]:
         """Generate 24-hour forecast for a single case"""
         
@@ -559,6 +858,10 @@ def main():
     parser.add_argument('--landuse-pbf', help='Land use PBF file (optional)')
     parser.add_argument('--output-file', required=True, help='Output JSON file')
     parser.add_argument('--train', action='store_true', help='Train models from data')
+    parser.add_argument('--evaluate', action='store_true', help='Evaluate with train/validation/test splits')
+    parser.add_argument('--split-type', choices=['temporal', 'random'], default='temporal', 
+                       help='Data splitting strategy for evaluation')
+    parser.add_argument('--include-lstm', action='store_true', help='Include LSTM model in ensemble')
     
     args = parser.parse_args()
     
@@ -569,30 +872,83 @@ def main():
         # Load data
         logger.info(f"Loading data from {args.data_file}")
         data = system.data_processor.load_data(args.data_file)
+        cases = data.get('cases', [])
         
-        if args.train:
+        if args.evaluate:
+            # Evaluation mode with train/validation/test splits
+            logger.info(f"Evaluation mode with {args.split_type} splitting")
+            
+            # Split data
+            if args.split_type == 'temporal':
+                train_cases, valid_cases, test_cases = system.data_processor.split_cases_temporal(
+                    cases, train_ratio=0.7, valid_ratio=0.15, test_ratio=0.15
+                )
+            else:
+                train_cases, valid_cases, test_cases = system.data_processor.split_cases_random(
+                    cases, train_ratio=0.7, valid_ratio=0.15, random_state=42
+                )
+            
+            # Train with validation
+            logger.info("Training models with validation...")
+            validation_metrics = system.train_with_validation(
+                train_cases, valid_cases, include_lstm=args.include_lstm
+            )
+            
+            # Evaluate on test set
+            logger.info("Evaluating on test set...")
+            test_metrics = system.evaluate_test_set(test_cases)
+            
+            # Save evaluation results
+            eval_results = {
+                'evaluation_info': {
+                    'timestamp': datetime.now().isoformat(),
+                    'split_type': args.split_type,
+                    'include_lstm': args.include_lstm,
+                    'total_cases': len(cases),
+                    'train_cases': len(train_cases),
+                    'validation_cases': len(valid_cases),
+                    'test_cases': len(test_cases)
+                },
+                'validation_metrics': validation_metrics,
+                'test_metrics': test_metrics
+            }
+            
+            eval_output = args.output_file.replace('.json', '_evaluation.json')
+            with open(eval_output, 'w') as f:
+                json.dump(eval_results, f, indent=2)
+            
+            logger.info(f"Evaluation results saved to {eval_output}")
+            
+            # Print summary
+            print(f"\nEvaluation Summary:")
+            print(f"Test R²: {test_metrics['r2']:.3f}")
+            print(f"Test MAE: {test_metrics['mae']:.2f}")
+            print(f"Test RMSE: {test_metrics['rmse']:.2f}")
+            
+        elif args.train:
             # Training mode - use data to train models
             logger.info("Training mode: building models from provided data")
-            system.train_from_historical_data(data.get('cases', []))
+            system.train_from_historical_data(cases)
         else:
             # Inference mode - load pre-trained models or use simple baseline
             logger.info("Inference mode: using baseline models")
             # For hackathon: train on available data quickly
-            system.train_from_historical_data(data.get('cases', []))
+            system.train_from_historical_data(cases)
         
-        # Generate predictions
-        logger.info("Generating forecasts...")
-        predictions = system.process_all_cases(data)
-        
-        # Validate output format
-        if not validate_output_format(predictions):
-            logger.error("Output format validation failed")
-            sys.exit(1)
-        
-        # Save predictions
-        logger.info(f"Saving predictions to {args.output_file}")
-        with open(args.output_file, 'w') as f:
-            json.dump(predictions, f, indent=2)
+        # Generate predictions (unless in evaluate-only mode)
+        if not args.evaluate:
+            logger.info("Generating forecasts...")
+            predictions = system.process_all_cases(data)
+            
+            # Validate output format
+            if not validate_output_format(predictions):
+                logger.error("Output format validation failed")
+                sys.exit(1)
+            
+            # Save predictions
+            logger.info(f"Saving predictions to {args.output_file}")
+            with open(args.output_file, 'w') as f:
+                json.dump(predictions, f, indent=2)
         
         logger.info("Forecasting completed successfully")
         sys.exit(0)
