@@ -264,8 +264,9 @@ class LightGBMForecaster(BaseForecaster):
             'objective': 'regression',
             'metric': 'mae',
             'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'learning_rate': 0.1,
+            'num_leaves': 100,
+            'max_depth':10,
+            'learning_rate': 1e-4,
             'feature_fraction': 0.9,
             'bagging_fraction': 0.8,
             'bagging_freq': 5,
@@ -305,8 +306,8 @@ class CatBoostForecaster(BaseForecaster):
         super().__init__("CatBoost")
         self.params = params or {
             'iterations': 1000,
-            'learning_rate': 0.1,
-            'depth': 6,
+            'learning_rate': 1e-4,
+            'depth': 10,
             'loss_function': 'MAE',
             'verbose': True,
             'early_stopping_rounds': 50
