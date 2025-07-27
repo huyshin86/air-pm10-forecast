@@ -2,6 +2,11 @@
 __pycache__/
 *.py[codz]
 *$py.class
+catboost_info/
+data/
+notebooks/
+src/
+test/
 
 # C extensions
 *.so
