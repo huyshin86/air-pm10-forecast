@@ -2,6 +2,7 @@
 """
 Convert Excel/CSV data to the JSON format required by the PM10 forecasting model.
 This script processes Krakow air quality and weather data from 2019-2023.
+Modified to set prediction_start_time to 2 days after the case day.
 """
 
 import pandas as pd
@@ -72,15 +73,13 @@ class DataConverter:
         """Convert weather data to METAR-style format expected by model"""
         weather_record = {}
         
-        # Add date for timestamp tracking - this is CRITICAL for merging
+        # Add date for timestamp tracking
         if 'DateTime' in weather_row and pd.notna(weather_row['DateTime']):
             weather_record['date'] = weather_row['DateTime'].strftime('%Y-%m-%dT%H:%M:%S')
         elif 'DATE' in weather_row and pd.notna(weather_row['DATE']):
-            # Parse the DATE string format from the CSV
             date_str = str(weather_row['DATE'])
-            if len(date_str) >= 8:  # Format like '20190101'
+            if len(date_str) >= 8:
                 try:
-                    # Parse YYYYMMDDHH format
                     year = date_str[:4]
                     month = date_str[4:6]
                     day = date_str[6:8]
@@ -90,19 +89,19 @@ class DataConverter:
                 except:
                     pass
         
-        # Temperature encoding: the TMP field is already in METAR format
+        # Temperature encoding
         if 'TMP' in weather_row and pd.notna(weather_row['TMP']) and weather_row['TMP'] != '99999':
             weather_record['tmp'] = str(weather_row['TMP'])
         
-        # Wind encoding: the WND field is already in METAR format
+        # Wind encoding
         if 'WND' in weather_row and pd.notna(weather_row['WND']) and weather_row['WND'] != '999999999':
             weather_record['wnd'] = str(weather_row['WND'])
         
-        # Sea level pressure: SLP is already in METAR format
+        # Sea level pressure
         if 'SLP' in weather_row and pd.notna(weather_row['SLP']) and weather_row['SLP'] != '99999':
             weather_record['slp'] = str(weather_row['SLP'])
             
-        # Visibility: VIS is already in METAR format  
+        # Visibility
         if 'VIS' in weather_row and pd.notna(weather_row['VIS']) and weather_row['VIS'] != '999999':
             weather_record['vis'] = str(weather_row['VIS'])
             
@@ -113,9 +112,9 @@ class DataConverter:
         return weather_record
     
     def create_training_cases(self, years: list = [2019, 2020, 2021, 2022, 2023]):
-        """Create training cases with 1 case per day"""
+        """Create training cases with prediction_start_time = case_day + 2 days"""
         cases = []
-        case_id = 0
+        case_id = 1
         stations_df = self.load_stations()
 
         for year in years:
@@ -127,36 +126,41 @@ class DataConverter:
             if air_df is None or weather_df is None:
                 logger.warning(f"Skipping year {year} - missing data files")
                 continue
-            start_date = pd.Timestamp(f'{year}-01-01')
-            end_date = pd.Timestamp(f'{year}-12-31')
             
-            # Tạo list tất cả ngày trong năm
+            # Start from January 1st
+            start_date = pd.Timestamp(f'{year}-01-01')
+            # End earlier to ensure we have enough data for 2-day-ahead prediction
+            end_date = pd.Timestamp(f'{year}-12-29')  # Stop at Dec 29 to allow 2 days ahead
+            
+            # Create list of all days in the year (except last 2 days)
             date_range = pd.date_range(start=start_date, end=end_date, freq='D')
             
             for current_date in date_range:
-                # Mỗi case sử dụng dữ liệu 1 ngày (24 giờ)
+                # Each case uses data from current_date (full day)
                 case_start = current_date
                 case_end = current_date + pd.Timedelta(hours=23, minutes=59)
                 
-                # Filter data cho ngày này
+                # Filter air quality data for this day
                 case_air_data = air_df[
                     (air_df['DateTime'] >= case_start) & 
                     (air_df['DateTime'] <= case_end)
                 ].copy()
                 
+                # Filter weather data for this day
                 case_weather_data = weather_df[
                     (weather_df['DateTime'] >= case_start) & 
                     (weather_df['DateTime'] <= case_end)
                 ].copy()
                 
-                # Cần ít nhất 12 giờ dữ liệu để tạo case (thay vì 24)
+                # Need at least 12 hours of data to create a case
                 if len(case_air_data) < 12:  
                     continue
                     
-                # Prediction start time = cuối ngày hiện tại
-                prediction_time = (case_end + pd.Timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%S')
+                # Prediction start time = current_date + 2 days at 00:00:00
+                prediction_date = current_date + pd.Timedelta(days=2)
+                prediction_time = prediction_date.strftime('%Y-%m-%dT00:00:00')
                 
-                # Tạo case
+                # Create case
                 case = {
                     "case_id": f"case_{case_id:04d}",
                     "stations": [],
@@ -167,8 +171,11 @@ class DataConverter:
                     },
                     "weather": []
                 }
+                
+                # Get station columns (exclude DateTime)
                 station_columns = [col for col in case_air_data.columns if col != 'DateTime']
-                # Add station data (giữ nguyên logic cũ)
+                
+                # Add station data
                 for station_col in station_columns:
                     station_lat = 50.057678  
                     station_lon = 19.926189
@@ -178,7 +185,7 @@ class DataConverter:
                         station_info = stations_df[stations_df['Station Code'] == station_code]
                         
                         if station_info.empty and station_col.startswith('Mp'):
-                        # Thử direct match nếu column name chính là station code
+                            # Try direct match if column name is the station code
                             station_info = stations_df[stations_df['Station Code'] == station_col]
                     
                         if not station_info.empty:
@@ -197,22 +204,22 @@ class DataConverter:
                                 "pm10": float(row[station_col])
                             })
                     
-                    # Chỉ add station nếu có ít nhất 12 giờ data
+                    # Only add station if has at least 12 hours of data
                     if len(history) >= 12:  
                         case["stations"].append({
-                            "station_code": station_col,  # Sử dụng column name làm station code
+                            "station_code": station_col,
                             "longitude": station_lon,
                             "latitude": station_lat,
                             "history": history
                         })
                 
-                # Add weather data - SỬA: Sử dụng encode_weather_metar_style
+                # Add weather data
                 for _, weather_row in case_weather_data.iterrows():
                     weather_entry = self.encode_weather_metar_style(weather_row)
-                    if weather_entry:  # Chỉ add nếu có data
+                    if weather_entry:  # Only add if has data
                         case["weather"].append(weather_entry)
                 
-                # Chỉ add case nếu có đủ stations và weather data
+                # Only add case if has sufficient stations and weather data
                 if len(case["stations"]) > 0 and len(case["weather"]) > 0:
                     cases.append(case)
                     case_id += 1
@@ -223,7 +230,7 @@ class DataConverter:
         logger.info(f"Total cases created: {case_id}")
         return cases
 
-    def convert_and_save(self, output_file: str = "training_data.json", 
+    def convert_and_save(self, output_file: str = "krakow_training_data.json", 
                         years: list = [2019, 2020, 2021, 2022, 2023]):
         """Convert data and save to JSON file"""
         
@@ -232,7 +239,7 @@ class DataConverter:
         # Create training cases
         cases = self.create_training_cases(years)
         
-        # SỬA: Wrap in correct format
+        # Wrap in correct format
         training_data = {
             "cases": cases
         }
@@ -246,7 +253,7 @@ class DataConverter:
         return training_data
 
 def main():
-    """Convert Krakow data to model format"""
+    """Convert Krakow data to model format with 2-day-ahead prediction"""
     
     converter = DataConverter()
     
@@ -267,10 +274,14 @@ def main():
         print(f"   Case ID: {sample_case['case_id']}")
         print(f"   Stations: {len(sample_case['stations'])}")
         print(f"   Weather records: {len(sample_case['weather'])}")
+        print(f"   Prediction start time: {sample_case['target']['prediction_start_time']}")
         if sample_case['stations']:
-            print(f"   Sample station: {sample_case['stations'][0]['station_code']}")
-            print(f"   History length: {len(sample_case['stations'][0]['history'])} records")
-
+            first_station = sample_case['stations'][0]
+            print(f"   Sample station: {first_station['station_code']}")
+            print(f"   History length: {len(first_station['history'])} records")
+            if first_station['history']:
+                print(f"   First timestamp: {first_station['history'][0]['timestamp']}")
+                print(f"   Last timestamp: {first_station['history'][-1]['timestamp']}")
 
 if __name__ == "__main__":
     main()
