@@ -279,12 +279,15 @@ class LightGBMForecaster(BaseForecaster):
             'objective': 'regression',
             'metric': 'mae',
             'boosting_type': 'gbdt',
-            'num_leaves': 50,
-            'max_depth': 6,
-            'learning_rate': 0.1,
+            'num_leaves': 80,  # Increased complexity
+            'max_depth': 8,    # Increased depth
+            'learning_rate': 0.08,  # Slightly reduced to allow more iterations
             'feature_fraction': 0.9,
             'bagging_fraction': 0.8,
             'bagging_freq': 5,
+            'min_data_in_leaf': 10,  # Reduced to allow more splits
+            'lambda_l1': 0.1,  # Small regularization
+            'lambda_l2': 0.1,
             'verbose': 10
         }
     
@@ -298,9 +301,9 @@ class LightGBMForecaster(BaseForecaster):
         self.model = lgb.train(
             self.params,
             train_data,
-            num_boost_round=1000,
+            num_boost_round=2000,  # Increased from 1000
             valid_sets=[train_data],
-            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
+            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]  # Increased patience
         )
         
         self.is_trained = True
@@ -320,12 +323,15 @@ class CatBoostForecaster(BaseForecaster):
     def __init__(self, params: Dict = None):
         super().__init__("CatBoost")
         self.params = params or {
-            'iterations': 1000,
-            'learning_rate': 0.1,
-            'depth': 6,
+            'iterations': 2000,  # Increased from 1000
+            'learning_rate': 0.08,  # Slightly reduced to allow more iterations
+            'depth': 8,  # Increased depth
             'loss_function': 'MAE',
             'verbose': True,
-            'early_stopping_rounds': 50
+            'early_stopping_rounds': 100,  # Increased from 50
+            'l2_leaf_reg': 1,  # Small regularization
+            'random_strength': 0.1,  # Reduced randomness for better fitting
+            'bagging_temperature': 0.8
         }
     
     def train(self, X: np.ndarray, y: np.ndarray):
@@ -351,8 +357,10 @@ class RandomForestForecaster(BaseForecaster):
     def __init__(self, params: Dict = None):
         super().__init__("RandomForest")
         self.params = params or {
-            'n_estimators': 100,
-            'max_depth': 10,
+            'n_estimators': 300,  # Further increased
+            'max_depth': 12,      # Increased depth for more complexity
+            'min_samples_split': 5,  # Reduced for more splits
+            'min_samples_leaf': 2,   # Reduced for more granular predictions
             'random_state': 42,
             'n_jobs': 1  # Single core constraint
         }
@@ -377,7 +385,7 @@ class RandomForestForecaster(BaseForecaster):
 class LSTMForecaster(BaseForecaster):
     """LSTM model with dropout for PM10 forecasting"""
     
-    def __init__(self, lstm_units: int = 64, dropout_rate: float = 0.3, sequence_length: int = 24, epochs: int = 100):
+    def __init__(self, lstm_units: int = 64, dropout_rate: float = 0.3, sequence_length: int = 24, epochs: int = 200):  # Increased epochs
         super().__init__("LSTM")
         self.lstm_units = lstm_units
         self.dropout_rate = dropout_rate
@@ -412,7 +420,7 @@ class LSTMForecaster(BaseForecaster):
         
         # Train model
         early_stopping = tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss', patience=10, restore_best_weights=True
+            monitor='val_loss', patience=20, restore_best_weights=True  # Increased patience
         )
         
         history = self.model.fit(
@@ -522,6 +530,47 @@ class EnsembleForecaster:
         ensemble_pred = np.average(predictions, axis=0, weights=valid_weights)
         
         return ensemble_pred
+    
+    def predict_with_individual_outputs(self, X: np.ndarray) -> Dict:
+        """Make predictions and return both individual model outputs and ensemble result"""
+        
+        # Ensure the input has the same features as training
+        if X.shape[1] != len(self.feature_columns):
+            raise ValueError(f"Input has {X.shape[1]} features, but model was trained with {len(self.feature_columns)} features")
+        
+        # Scale the input data
+        X_scaled = self.scaler.transform(X)
+        
+        individual_predictions = {}
+        ensemble_predictions = []
+        valid_weights = []
+        
+        for model, weight in zip(self.models, self.weights):
+            if weight > 0 and model.is_trained:
+                try:
+                    pred = model.predict(X_scaled)
+                    individual_predictions[model.model_name] = pred
+                    ensemble_predictions.append(pred)
+                    valid_weights.append(weight)
+                except Exception as e:
+                    logger.error(f"Prediction failed for {model.model_name}: {e}")
+                    individual_predictions[model.model_name] = None
+        
+        if not ensemble_predictions:
+            raise ValueError("No models available for prediction")
+        
+        # Weighted average for ensemble
+        ensemble_predictions = np.array(ensemble_predictions)
+        valid_weights = np.array(valid_weights)
+        valid_weights = valid_weights / valid_weights.sum()  # Normalize
+        
+        ensemble_pred = np.average(ensemble_predictions, axis=0, weights=valid_weights)
+        
+        return {
+            'individual_predictions': individual_predictions,
+            'ensemble_prediction': ensemble_pred,
+            'weights': {model.model_name: weight for model, weight in zip(self.models, self.weights)}
+        }
 
 
 class PM10ForecastingSystem:
@@ -700,7 +749,7 @@ class PM10ForecastingSystem:
         return validation_metrics
     
     def evaluate_test_set(self, test_cases: List[Dict]) -> Dict:
-        """Evaluate trained models on test set"""
+        """Evaluate trained models on test set with individual model outputs"""
         
         if self.ensemble is None:
             raise ValueError("Models must be trained before evaluation")
@@ -740,26 +789,68 @@ class PM10ForecastingSystem:
         base_forecaster = BaseForecaster("temp")
         X_test, y_test, _ = base_forecaster.prepare_training_data(combined_test_features)
         
-        # Make predictions
-        y_pred = self.ensemble.predict(X_test)
+        # Make predictions with individual model outputs
+        prediction_results = self.ensemble.predict_with_individual_outputs(X_test)
         
-        # Calculate comprehensive metrics
-        test_metrics = {
-            'mae': float(mean_absolute_error(y_test, y_pred)),
-            'rmse': float(np.sqrt(mean_squared_error(y_test, y_pred))),
-            'r2': float(r2_score(y_test, y_pred)),
-            'mape': float(np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 1e-8))) * 100),
+        # Extract ensemble predictions
+        y_pred_ensemble = prediction_results['ensemble_prediction']
+        individual_predictions = prediction_results['individual_predictions']
+        model_weights = prediction_results['weights']
+        
+        # Calculate metrics for ensemble
+        ensemble_metrics = {
+            'mae': float(mean_absolute_error(y_test, y_pred_ensemble)),
+            'rmse': float(np.sqrt(mean_squared_error(y_test, y_pred_ensemble))),
+            'r2': float(r2_score(y_test, y_pred_ensemble)),
+            'mape': float(np.mean(np.abs((y_test - y_pred_ensemble) / np.maximum(y_test, 1e-8))) * 100),
             'samples': len(y_test),
             'mean_actual': float(np.mean(y_test)),
-            'mean_predicted': float(np.mean(y_pred)),
+            'mean_predicted': float(np.mean(y_pred_ensemble)),
             'std_actual': float(np.std(y_test)),
-            'std_predicted': float(np.std(y_pred))
+            'std_predicted': float(np.std(y_pred_ensemble))
         }
         
-        logger.info(f"Test Metrics - MAE: {test_metrics['mae']:.2f}, "
-                   f"RMSE: {test_metrics['rmse']:.2f}, "
-                   f"R²: {test_metrics['r2']:.3f}, "
-                   f"MAPE: {test_metrics['mape']:.2f}%")
+        # Calculate metrics for individual models
+        individual_metrics = {}
+        for model_name, y_pred_individual in individual_predictions.items():
+            if y_pred_individual is not None:
+                individual_metrics[model_name] = {
+                    'mae': float(mean_absolute_error(y_test, y_pred_individual)),
+                    'rmse': float(np.sqrt(mean_squared_error(y_test, y_pred_individual))),
+                    'r2': float(r2_score(y_test, y_pred_individual)),
+                    'mape': float(np.mean(np.abs((y_test - y_pred_individual) / np.maximum(y_test, 1e-8))) * 100),
+                    'mean_predicted': float(np.mean(y_pred_individual)),
+                    'std_predicted': float(np.std(y_pred_individual)),
+                    'weight': float(model_weights.get(model_name, 0.0))
+                }
+        
+        # Combine all results
+        test_metrics = {
+            'ensemble_metrics': ensemble_metrics,
+            'individual_model_metrics': individual_metrics,
+            'model_weights': model_weights,
+            'predictions': {
+                'actual': y_test.tolist(),
+                'ensemble': y_pred_ensemble.tolist(),
+                'individual_models': {
+                    model_name: pred.tolist() if pred is not None else None 
+                    for model_name, pred in individual_predictions.items()
+                }
+            }
+        }
+        
+        # Log summary
+        logger.info(f"Ensemble Test Metrics - MAE: {ensemble_metrics['mae']:.2f}, "
+                   f"RMSE: {ensemble_metrics['rmse']:.2f}, "
+                   f"R²: {ensemble_metrics['r2']:.3f}, "
+                   f"MAPE: {ensemble_metrics['mape']:.2f}%")
+        
+        # Log individual model performance
+        for model_name, metrics in individual_metrics.items():
+            logger.info(f"{model_name} - MAE: {metrics['mae']:.2f}, "
+                       f"RMSE: {metrics['rmse']:.2f}, "
+                       f"R²: {metrics['r2']:.3f}, "
+                       f"Weight: {metrics['weight']:.3f}")
         
         return test_metrics
     
@@ -920,6 +1011,46 @@ def main():
             logger.info("Evaluating on test set...")
             test_metrics = system.evaluate_test_set(test_cases)
             
+            # Generate predictions on test set
+            logger.info("Generating predictions on test set...")
+            test_data = {'cases': test_cases}
+            test_predictions = system.process_all_cases(test_data)
+            
+            # Save test predictions
+            test_output = args.output_file.replace('.json', '_test_predictions.json')
+            with open(test_output, 'w') as f:
+                json.dump(test_predictions, f, indent=2)
+            logger.info(f"Test predictions saved to {test_output}")
+            
+            # Save detailed model predictions and metrics
+            detailed_output = args.output_file.replace('.json', '_detailed_predictions.json')
+            detailed_results = {
+                'test_metrics': test_metrics,
+                'model_info': {
+                    'ensemble_weights': test_metrics['model_weights'],
+                    'individual_performance': test_metrics['individual_model_metrics']
+                },
+                'predictions_summary': {
+                    'num_samples': len(test_metrics['predictions']['actual']),
+                    'actual_stats': {
+                        'mean': float(np.mean(test_metrics['predictions']['actual'])),
+                        'std': float(np.std(test_metrics['predictions']['actual'])),
+                        'min': float(np.min(test_metrics['predictions']['actual'])),
+                        'max': float(np.max(test_metrics['predictions']['actual']))
+                    },
+                    'ensemble_stats': {
+                        'mean': float(np.mean(test_metrics['predictions']['ensemble'])),
+                        'std': float(np.std(test_metrics['predictions']['ensemble'])),
+                        'min': float(np.min(test_metrics['predictions']['ensemble'])),
+                        'max': float(np.max(test_metrics['predictions']['ensemble']))
+                    }
+                }
+            }
+            
+            with open(detailed_output, 'w') as f:
+                json.dump(detailed_results, f, indent=2)
+            logger.info(f"Detailed model predictions and metrics saved to {detailed_output}")
+            
             # Save evaluation results
             eval_results = {
                 'evaluation_info': {
@@ -943,9 +1074,19 @@ def main():
             
             # Print summary
             print(f"\nEvaluation Summary:")
-            print(f"Test R²: {test_metrics['r2']:.3f}")
-            print(f"Test MAE: {test_metrics['mae']:.2f}")
-            print(f"Test RMSE: {test_metrics['rmse']:.2f}")
+            print(f"=== Ensemble Model Performance ===")
+            print(f"Test R²: {test_metrics['ensemble_metrics']['r2']:.3f}")
+            print(f"Test MAE: {test_metrics['ensemble_metrics']['mae']:.2f}")
+            print(f"Test RMSE: {test_metrics['ensemble_metrics']['rmse']:.2f}")
+            
+            print(f"\n=== Individual Model Performance ===")
+            for model_name, metrics in test_metrics['individual_model_metrics'].items():
+                print(f"{model_name}:")
+                print(f"  R²: {metrics['r2']:.3f}, MAE: {metrics['mae']:.2f}, RMSE: {metrics['rmse']:.2f}, Weight: {metrics['weight']:.3f}")
+            
+            print(f"\nTest predictions saved to: {test_output}")
+            print(f"Detailed evaluation saved to: {eval_output}")
+            print(f"Detailed model predictions saved to: {detailed_output}")
             
         elif args.train:
             # Training mode - use data to train models
