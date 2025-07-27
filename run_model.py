@@ -151,6 +151,17 @@ class DataProcessor:
         pm10_data['dow_sin'] = np.sin(2 * np.pi * pm10_data['day_of_week'] / 7)
         pm10_data['dow_cos'] = np.cos(2 * np.pi * pm10_data['day_of_week'] / 7)
         
+        # Add more temporal patterns for better variation
+        pm10_data['is_weekend'] = (pm10_data['day_of_week'] >= 5).astype(int)
+        pm10_data['is_rush_hour'] = pm10_data['hour'].isin([7, 8, 9, 17, 18, 19]).astype(int)
+        pm10_data['is_night'] = pm10_data['hour'].isin([22, 23, 0, 1, 2, 3, 4, 5]).astype(int)
+        
+        # Season encoding
+        pm10_data['season'] = ((pm10_data['month'] % 12 + 3) // 3)
+        
+        # Hour squared for non-linear patterns
+        pm10_data['hour_squared'] = pm10_data['hour'] ** 2
+        
         # # Lag features
         for lag in [1, 2, 3, 6, 12, 24, 48]:
             pm10_data[f'pm10_lag_{lag}'] = pm10_data['pm10'].shift(lag)
@@ -172,6 +183,10 @@ class DataProcessor:
                 direction='nearest',
                 tolerance=pd.Timedelta('2H')
             )
+            
+            # Add weather interaction features
+            pm10_data['temp_hour_interaction'] = pm10_data['temperature'] * pm10_data['hour']
+            pm10_data['wind_temp_interaction'] = pm10_data['wind_speed'] * pm10_data['temperature']
         
         # Fill missing values
         pm10_data = pm10_data.fillna(method='ffill').fillna(method='bfill')
@@ -264,9 +279,9 @@ class LightGBMForecaster(BaseForecaster):
             'objective': 'regression',
             'metric': 'mae',
             'boosting_type': 'gbdt',
-            'num_leaves': 100,
-            'max_depth':10,
-            'learning_rate': 1e-4,
+            'num_leaves': 50,
+            'max_depth': 6,
+            'learning_rate': 0.1,
             'feature_fraction': 0.9,
             'bagging_fraction': 0.8,
             'bagging_freq': 5,
@@ -306,8 +321,8 @@ class CatBoostForecaster(BaseForecaster):
         super().__init__("CatBoost")
         self.params = params or {
             'iterations': 1000,
-            'learning_rate': 1e-4,
-            'depth': 10,
+            'learning_rate': 0.1,
+            'depth': 6,
             'loss_function': 'MAE',
             'verbose': True,
             'early_stopping_rounds': 50
