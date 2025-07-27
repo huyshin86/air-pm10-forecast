@@ -223,7 +223,7 @@ class LightGBMForecaster(BaseForecaster):
             'feature_fraction': 0.9,
             'bagging_fraction': 0.8,
             'bagging_freq': 5,
-            'verbose': -1
+            'verbose': 10
         }
     
     def train(self, X: np.ndarray, y: np.ndarray):
@@ -262,7 +262,7 @@ class CatBoostForecaster(BaseForecaster):
             'learning_rate': 0.1,
             'depth': 6,
             'loss_function': 'MAE',
-            'verbose': False,
+            'verbose': True,
             'early_stopping_rounds': 50
         }
     
