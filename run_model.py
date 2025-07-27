@@ -281,7 +281,7 @@ class LightGBMForecaster(BaseForecaster):
             'boosting_type': 'gbdt',
             'num_leaves': 80,  # Increased complexity
             'max_depth': 8,    # Increased depth
-            'learning_rate': 0.08,  # Slightly reduced to allow more iterations
+            'learning_rate': 0.001,  # Slightly reduced to allow more iterations
             'feature_fraction': 0.9,
             'bagging_fraction': 0.8,
             'bagging_freq': 5,
@@ -301,9 +301,9 @@ class LightGBMForecaster(BaseForecaster):
         self.model = lgb.train(
             self.params,
             train_data,
-            num_boost_round=2000,  # Increased from 1000
+            num_boost_round=20000,  # Increased from 2000
             valid_sets=[train_data],
-            callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)]  # Increased patience
+            callbacks=[lgb.early_stopping(150), lgb.log_evaluation(0)]  # Increased patience
         )
         
         self.is_trained = True
@@ -323,8 +323,8 @@ class CatBoostForecaster(BaseForecaster):
     def __init__(self, params: Dict = None):
         super().__init__("CatBoost")
         self.params = params or {
-            'iterations': 2000,  # Increased from 1000
-            'learning_rate': 0.08,  # Slightly reduced to allow more iterations
+            'iterations': 20000,  # Increased from 1000
+            'learning_rate': 0.001,  # Slightly reduced to allow more iterations
             'depth': 8,  # Increased depth
             'loss_function': 'MAE',
             'verbose': True,
@@ -357,10 +357,10 @@ class RandomForestForecaster(BaseForecaster):
     def __init__(self, params: Dict = None):
         super().__init__("RandomForest")
         self.params = params or {
-            'n_estimators': 300,  # Further increased
-            'max_depth': 12,      # Increased depth for more complexity
-            'min_samples_split': 5,  # Reduced for more splits
-            'min_samples_leaf': 2,   # Reduced for more granular predictions
+            'n_estimators': 3000,  # Increased from 300 to 500 trees
+            'max_depth': 15,      # Increased depth for more complexity
+            'min_samples_split': 3,  # Further reduced for more splits
+            'min_samples_leaf': 1,   # Minimum for maximum granularity
             'random_state': 42,
             'n_jobs': 1  # Single core constraint
         }
@@ -385,7 +385,7 @@ class RandomForestForecaster(BaseForecaster):
 class LSTMForecaster(BaseForecaster):
     """LSTM model with dropout for PM10 forecasting"""
     
-    def __init__(self, lstm_units: int = 64, dropout_rate: float = 0.3, sequence_length: int = 24, epochs: int = 200):  # Increased epochs
+    def __init__(self, lstm_units: int = 64, dropout_rate: float = 0.3, sequence_length: int = 24, epochs: int = 400):  # Increased epochs
         super().__init__("LSTM")
         self.lstm_units = lstm_units
         self.dropout_rate = dropout_rate
