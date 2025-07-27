@@ -151,14 +151,14 @@ class DataProcessor:
         pm10_data['dow_sin'] = np.sin(2 * np.pi * pm10_data['day_of_week'] / 7)
         pm10_data['dow_cos'] = np.cos(2 * np.pi * pm10_data['day_of_week'] / 7)
         
-        # Lag features
-        for lag in [1, 2, 3, 6, 12, 24, 48]:
-            pm10_data[f'pm10_lag_{lag}'] = pm10_data['pm10'].shift(lag)
+        # # Lag features
+        # for lag in [1, 2, 3, 6, 12, 24, 48]:
+        #     pm10_data[f'pm10_lag_{lag}'] = pm10_data['pm10'].shift(lag)
         
-        # Rolling statistics
-        for window in [3, 6, 12, 24]:
-            pm10_data[f'pm10_rolling_mean_{window}'] = pm10_data['pm10'].rolling(window=window).mean()
-            pm10_data[f'pm10_rolling_std_{window}'] = pm10_data['pm10'].rolling(window=window).std()
+        # # Rolling statistics
+        # for window in [3, 6, 12, 24]:
+        #     pm10_data[f'pm10_rolling_mean_{window}'] = pm10_data['pm10'].rolling(window=window).mean()
+        #     pm10_data[f'pm10_rolling_std_{window}'] = pm10_data['pm10'].rolling(window=window).std()
         
         # Weather features integration
         if weather_data is not None and len(weather_data) > 0:
