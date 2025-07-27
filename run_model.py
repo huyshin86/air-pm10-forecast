@@ -888,6 +888,12 @@ def main():
                     cases, train_ratio=0.7, valid_ratio=0.15, random_state=42
                 )
             
+            with open('train_cases.json', 'w', encoding='utf-8') as f:
+                json.dump({'cases': train_cases}, f, indent=2)
+            with open('valid_cases.json', 'w', encoding='utf-8') as f:
+                json.dump({'cases': valid_cases}, f, indent=2)
+            with open('test_cases.json', 'w', encoding='utf-8') as f:
+                json.dump({'cases': test_cases}, f, indent=2)
             # Train with validation
             logger.info("Training models with validation...")
             validation_metrics = system.train_with_validation(
