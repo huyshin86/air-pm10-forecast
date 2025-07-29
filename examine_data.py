@@ -74,6 +74,48 @@ def examine_data_structure():
     
     print("\n" + "=" * 50)
     print("✅ Data structure examination complete!")
+    # Examine specific columns AA1 and AA2
+    print("\n📊 EXAMINING SPECIFIC COLUMNS (AA1 and AA2):")
+    
+    # Check in Air Quality files
+    print("\n   Air Quality Files:")
+    for year in [2019, 2020, 2021, 2022, 2023]:
+        air_file = air_quality_dir / f"{year}_PM10_1g.xlsx"
+        if air_file.exists():
+            try:
+                df = pd.read_excel(air_file)
+                if 'AA1' in df.columns and 'AA2' in df.columns:
+                    print(f"\n   📅 {year} - AA1 and AA2 columns:")
+                    print(df[['AA1', 'AA2']].head(5))
+                else:
+                    available_cols = [col for col in ['AA1', 'AA2'] if col in df.columns]
+                    if available_cols:
+                        print(f"\n   📅 {year} - Found columns: {available_cols}")
+                        print(df[available_cols].head(5))
+                    else:
+                        print(f"\n   📅 {year} - AA1 and AA2 columns not found")
+            except Exception as e:
+                print(f"   Error examining AA1/AA2 in {year} air quality file: {e}")
+    
+    # Check in Weather files
+    print("\n   Weather Files:")
+    for year in [2019, 2020, 2021, 2022, 2023]:
+        weather_file = weather_dir / f"{year}.csv"
+        if weather_file.exists():
+            try:
+                df = pd.read_csv(weather_file)
+                if 'AA1' in df.columns and 'AA2' in df.columns:
+                    print(f"\n   📅 {year} - AA1 and AA2 columns:")
+                    print(df[['AA1', 'AA2']].head(5))
+                else:
+                    available_cols = [col for col in ['AA1', 'AA2'] if col in df.columns]
+                    if available_cols:
+                        print(f"\n   📅 {year} - Found columns: {available_cols}")
+                        print(df[available_cols].head(5))
+                    else:
+                        print(f"\n   📅 {year} - AA1 and AA2 columns not found")
+            except Exception as e:
+                print(f"   Error examining AA1/AA2 in {year} weather file: {e}")
 
 if __name__ == "__main__":
     examine_data_structure()
