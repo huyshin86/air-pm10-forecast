@@ -214,3 +214,4 @@ __marimo__/
 
 .vscode/
 .idea/
+.data/processed/krakow_training_data.json
