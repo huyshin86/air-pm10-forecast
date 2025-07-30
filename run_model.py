@@ -1371,7 +1371,6 @@ def main():
     
     parser = argparse.ArgumentParser(description='PM10 Forecasting System')
     parser.add_argument('--data-file', required=True, help='Input data JSON file')
-    parser.add_argument('--landuse-pbf', help='Land use PBF file (optional)')
     parser.add_argument('--output-file', required=True, help='Output JSON file')
     parser.add_argument('--train', action='store_true', help='Train models from data')
     parser.add_argument('--evaluate', action='store_true', help='Evaluate with train/validation/test splits')
