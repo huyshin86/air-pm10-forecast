@@ -252,42 +252,77 @@ class DataProcessor:
         
         return pm10_data
     
-    def prepare_case_data(self, case: Dict) -> Tuple[pd.DataFrame, Dict]:
-        """Process single case data"""
+    def prepare_case_data(self, case: Dict, min_history_hours: int = 24) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+        """Process single case data with station-specific handling"""
         
-        # Extract PM10 data from all stations
-        pm10_records = []
+        # Extract PM10 data by station (keep stations separate)
+        station_data = []
+        target_info = case['target']
+        prediction_start = pd.to_datetime(target_info['prediction_start_time'])
+        
         for station in case['stations']:
+            pm10_records = []
             for record in station['history']:
                 pm10_records.append({
                     'timestamp': record['timestamp'],
-                    'pm10': record['pm10'],
+                    'pm10': record['pm10']
+                })
+            
+            if not pm10_records:
+                continue
+                
+            pm10_df = pd.DataFrame(pm10_records)
+            pm10_df['timestamp'] = pd.to_datetime(pm10_df['timestamp'])
+            pm10_df = pm10_df.sort_values('timestamp')
+            
+            # Check if we have sufficient historical data before prediction start
+            latest_data_time = pm10_df['timestamp'].max()
+            hours_of_history = (latest_data_time - pm10_df['timestamp'].min()).total_seconds() / 3600
+            gap_to_prediction = (prediction_start - latest_data_time).total_seconds() / 3600
+            
+            # Allow up to 48 hours gap to prediction (forecasting scenario)
+            max_gap_hours = 48
+            
+            if hours_of_history < min_history_hours:
+                logger.warning(f"Station {station['station_code']} in case {case.get('case_id', 'unknown')} has insufficient history: {hours_of_history:.1f} hours (need {min_history_hours})")
+                continue
+                
+            if gap_to_prediction > max_gap_hours:
+                logger.warning(f"Station {station['station_code']} in case {case.get('case_id', 'unknown')} has too large gap to prediction: {gap_to_prediction:.1f} hours (max {max_gap_hours})")
+                continue
+            
+            # Process weather data
+            weather_df = None
+            if 'weather' in case and case['weather']:
+                weather_records = []
+                for weather_record in case['weather']:
+                    parsed_weather = self.parse_weather_data(weather_record)
+                    if parsed_weather is not None:
+                        weather_records.append(parsed_weather)
+                
+                if weather_records:
+                    weather_df = pd.DataFrame(weather_records)
+            
+            # Create features for this station
+            features_df = self.create_features(pm10_df, weather_df)
+            
+            # Only include if we have enough valid features after processing
+            if len(features_df) > min_history_hours:
+                station_info = {
                     'station_code': station['station_code'],
                     'latitude': station['latitude'],
-                    'longitude': station['longitude']
-                })
+                    'longitude': station['longitude'],
+                    'features_df': features_df
+                }
+                station_data.append(station_info)
         
-        pm10_df = pd.DataFrame(pm10_records)
-        
-        # Process weather data
-        weather_df = None
-        if 'weather' in case and case['weather']:
-            weather_records = []
-            for weather_record in case['weather']:
-                parsed_weather = self.parse_weather_data(weather_record)
-                if parsed_weather is not None:  # Only add valid weather records
-                    weather_records.append(parsed_weather)
-            
-            if weather_records:  # Only create DataFrame if we have valid records
-                weather_df = pd.DataFrame(weather_records)
-        
-        # Create features
-        features_df = self.create_features(pm10_df, weather_df)
-        
-        # Target information
-        target_info = case['target']
-        
-        return features_df, target_info
+        # Return the first valid station's data for backward compatibility with training
+        # but also return all station data for station-specific predictions
+        if station_data:
+            return station_data[0]['features_df'], target_info, station_data
+        else:
+            # No valid stations found
+            return pd.DataFrame(), target_info, []
 
 
 class BaseForecaster:
@@ -859,7 +894,14 @@ class PM10ForecastingSystem:
         
         for case in training_cases:
             try:
-                features_df, _ = self.data_processor.prepare_case_data(case)
+                features_df, _, station_data = self.data_processor.prepare_case_data(case)
+                
+                if len(station_data) == 0:
+                    logger.warning(f"Skipping case {case.get('case_id', 'unknown')} - no valid stations")
+                    continue
+                
+                # Use the first valid station's data for training
+                features_df = station_data[0]['features_df']
                 
                 # Fill missing weather values with 0 or reasonable defaults
                 features_df = features_df.fillna({
@@ -910,7 +952,13 @@ class PM10ForecastingSystem:
         
         for case in training_cases:
             try:
-                features_df, _ = self.data_processor.prepare_case_data(case)
+                features_df, _, station_data = self.data_processor.prepare_case_data(case)
+                
+                if len(station_data) == 0:
+                    continue
+                
+                # Use the first valid station's data for training
+                features_df = station_data[0]['features_df']
                 
                 # Fill missing weather values with defaults
                 features_df = features_df.fillna({
@@ -986,7 +1034,14 @@ class PM10ForecastingSystem:
             
             for case in validation_cases:
                 try:
-                    features_df, _ = self.data_processor.prepare_case_data(case)
+                    features_df, _, station_data = self.data_processor.prepare_case_data(case)
+                    
+                    if len(station_data) == 0:
+                        continue
+                    
+                    # Use the first valid station's data
+                    features_df = station_data[0]['features_df']
+                    
                     features_df = features_df.fillna({
                         'humidity': 50.0,
                         'pressure': 1013.25,
@@ -1040,7 +1095,14 @@ class PM10ForecastingSystem:
         
         for case in test_cases:
             try:
-                features_df, _ = self.data_processor.prepare_case_data(case)
+                features_df, _, station_data = self.data_processor.prepare_case_data(case)
+                
+                if len(station_data) == 0:
+                    continue
+                
+                # Use the first valid station's data
+                features_df = station_data[0]['features_df']
+                
                 features_df = features_df.fillna({
                     'humidity': 50.0,
                     'pressure': 1013.25,
@@ -1132,105 +1194,174 @@ class PM10ForecastingSystem:
         
         return test_metrics
     
-    def forecast_case(self, case: Dict) -> List[Dict]:
-        """Generate 24-hour forecast for a single case"""
+    def forecast_case(self, case: Dict) -> Dict:
+        """Generate 24-hour forecast for a single case with station-specific predictions"""
         
         if self.ensemble is None:
             raise ValueError("Models must be trained before forecasting")
         
-        # Process case data
-        features_df, target_info = self.data_processor.prepare_case_data(case)
+        case_id = case.get('case_id', 'unknown')
         
-        # Fill missing weather values with defaults
-        features_df = features_df.fillna({
-            'humidity': 50.0,
-            'pressure': 1013.25,
-            'temperature': 15.0,
-            'wind_speed': 5.0,
-            'wind_direction': 180.0
-        })
+        # Process case data with station-specific handling
+        try:
+            _, target_info, station_data = self.data_processor.prepare_case_data(case)
+        except Exception as e:
+            logger.error(f"Error preparing case {case_id}: {e}")
+            return {
+                'case_id': case_id,
+                'status': 'error',
+                'error': str(e),
+                'forecasts': []
+            }
+        
+        if not station_data:
+            logger.warning(f"Case {case_id} has no valid stations with sufficient historical data")
+            return {
+                'case_id': case_id,
+                'status': 'insufficient_data',
+                'forecasts': []
+            }
         
         # Get prediction start time
         prediction_start = pd.to_datetime(target_info['prediction_start_time'])
         
-        # Generate features for each of the 24 hours
-        forecasts = []
+        # Generate forecasts for each valid station
+        station_forecasts = []
         
-        for hour in range(24):
-            forecast_time = prediction_start + pd.Timedelta(hours=hour)
+        for station_info in station_data:
+            station_code = station_info['station_code']
+            features_df = station_info['features_df']
             
-            # Create feature vector for this time (using latest available data)
-            latest_features = features_df.iloc[-1:].copy()
-            
-            # Update temporal features for forecast time
-            latest_features.loc[latest_features.index[0], 'hour'] = forecast_time.hour
-            latest_features.loc[latest_features.index[0], 'day_of_week'] = forecast_time.dayofweek
-            latest_features.loc[latest_features.index[0], 'month'] = forecast_time.month
-            latest_features.loc[latest_features.index[0], 'day_of_year'] = forecast_time.dayofyear
-            
-            # Update cyclical features
-            latest_features.loc[latest_features.index[0], 'hour_sin'] = np.sin(2 * np.pi * forecast_time.hour / 24)
-            latest_features.loc[latest_features.index[0], 'hour_cos'] = np.cos(2 * np.pi * forecast_time.hour / 24)
-            latest_features.loc[latest_features.index[0], 'dow_sin'] = np.sin(2 * np.pi * forecast_time.dayofweek / 7)
-            latest_features.loc[latest_features.index[0], 'dow_cos'] = np.cos(2 * np.pi * forecast_time.dayofweek / 7)
-            
-            # Ensure we have all required columns, fill missing ones with defaults
-            for col in self.ensemble.feature_columns:
-                if col not in latest_features.columns:
-                    latest_features[col] = 0.0  # Default value for missing features
-            
-            # Extract only the feature columns that were used during training
-            feature_data = latest_features[self.ensemble.feature_columns]
-            X = feature_data.values
-            
-            # Make prediction
-            pm10_pred = self.ensemble.predict(X)[0]
-            
-            # Ensure non-negative prediction
-            pm10_pred = max(0.0, pm10_pred)
-            
-            forecasts.append({
-                'timestamp': forecast_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                'pm10_pred': float(pm10_pred)
-            })
+            try:
+                # Fill missing weather values with defaults
+                features_df = features_df.fillna({
+                    'humidity': 50.0,
+                    'pressure': 1013.25,
+                    'temperature': 15.0,
+                    'wind_speed': 5.0,
+                    'wind_direction': 180.0
+                })
+                
+                # Generate features for each of the 24 hours
+                hourly_forecasts = []
+                
+                for hour in range(24):
+                    forecast_time = prediction_start + pd.Timedelta(hours=hour)
+                    
+                    # Create feature vector for this time (using latest available data)
+                    latest_features = features_df.iloc[-1:].copy()
+                    
+                    # Update temporal features for forecast time
+                    latest_features.loc[latest_features.index[0], 'hour'] = forecast_time.hour
+                    latest_features.loc[latest_features.index[0], 'day_of_week'] = forecast_time.dayofweek
+                    latest_features.loc[latest_features.index[0], 'month'] = forecast_time.month
+                    latest_features.loc[latest_features.index[0], 'day_of_year'] = forecast_time.dayofyear
+                    
+                    # Update cyclical features
+                    latest_features.loc[latest_features.index[0], 'hour_sin'] = np.sin(2 * np.pi * forecast_time.hour / 24)
+                    latest_features.loc[latest_features.index[0], 'hour_cos'] = np.cos(2 * np.pi * forecast_time.hour / 24)
+                    latest_features.loc[latest_features.index[0], 'dow_sin'] = np.sin(2 * np.pi * forecast_time.dayofweek / 7)
+                    latest_features.loc[latest_features.index[0], 'dow_cos'] = np.cos(2 * np.pi * forecast_time.dayofweek / 7)
+                    
+                    # Ensure we have all required columns, fill missing ones with defaults
+                    for col in self.ensemble.feature_columns:
+                        if col not in latest_features.columns:
+                            latest_features[col] = 0.0  # Default value for missing features
+                    
+                    # Extract only the feature columns that were used during training
+                    feature_data = latest_features[self.ensemble.feature_columns]
+                    X = feature_data.values
+                    
+                    # Make prediction
+                    pm10_pred = self.ensemble.predict(X)[0]
+                    
+                    # Ensure non-negative prediction
+                    pm10_pred = max(0.0, pm10_pred)
+                    
+                    hourly_forecasts.append({
+                        'timestamp': forecast_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'pm10_pred': float(pm10_pred)
+                    })
+                
+                station_forecasts.append({
+                    'station_code': station_code,
+                    'latitude': station_info['latitude'],
+                    'longitude': station_info['longitude'],
+                    'forecast': hourly_forecasts
+                })
+                
+                logger.info(f"Generated forecast for station {station_code} in case {case_id}")
+                
+            except Exception as e:
+                logger.error(f"Error forecasting station {station_code} in case {case_id}: {e}")
+                station_forecasts.append({
+                    'station_code': station_code,
+                    'latitude': station_info['latitude'],
+                    'longitude': station_info['longitude'],
+                    'status': 'error',
+                    'error': str(e),
+                    'forecast': []
+                })
         
-        return forecasts
+        return {
+            'case_id': case_id,
+            'status': 'success',
+            'forecasts': station_forecasts
+        }
     
     def process_all_cases(self, data: Dict) -> Dict:
-        """Process all cases and generate forecasts"""
+        """Process all cases and generate forecasts with proper case ID matching"""
         
         cases = data.get('cases', [])
         predictions = []
+        skipped_cases = []
         
         logger.info(f"Processing {len(cases)} cases for prediction")
         
         for case in cases:
+            case_id = case.get('case_id', 'unknown')
+            logger.info(f"Processing case: {case_id}")
+            
             try:
-                case_id = case['case_id']
-                logger.info(f"Processing case: {case_id}")
+                forecast_result = self.forecast_case(case)
                 
-                forecast = self.forecast_case(case)
-                
-                predictions.append({
-                    'case_id': case_id,
-                    'forecast': forecast
-                })
+                if forecast_result['status'] == 'success' and forecast_result['forecasts']:
+                    predictions.append(forecast_result)
+                else:
+                    # Case failed or has no valid forecasts
+                    skipped_cases.append({
+                        'case_id': case_id,
+                        'reason': forecast_result.get('error', 'insufficient_data'),
+                        'status': forecast_result['status']
+                    })
+                    logger.warning(f"Skipped case {case_id}: {forecast_result['status']}")
                 
             except Exception as e:
-                logger.error(f"Error processing case {case.get('case_id', 'unknown')}: {e}")
-                # Create empty forecast to maintain format
-                predictions.append({
-                    'case_id': case.get('case_id', 'unknown'),
-                    'forecast': [
-                        {
-                            'timestamp': (pd.to_datetime(case['target']['prediction_start_time']) + 
-                                        pd.Timedelta(hours=h)).strftime('%Y-%m-%dT%H:%M:%SZ'),
-                            'pm10_pred': 0.0
-                        } for h in range(24)
-                    ]
+                logger.error(f"Error processing case {case_id}: {e}")
+                skipped_cases.append({
+                    'case_id': case_id,
+                    'reason': str(e),
+                    'status': 'error'
                 })
         
-        return {'predictions': predictions}
+        # Log summary
+        logger.info(f"Successfully processed {len(predictions)} cases")
+        logger.info(f"Skipped {len(skipped_cases)} cases due to insufficient data or errors")
+        
+        if skipped_cases:
+            logger.info("Skipped cases:")
+            for skipped in skipped_cases:
+                logger.info(f"  - {skipped['case_id']}: {skipped['reason']}")
+        
+        return {
+            'predictions': predictions,
+            'metadata': {
+                'total_input_cases': len(cases),
+                'successful_predictions': len(predictions),
+                'skipped_cases': len(skipped_cases),
+                'skipped_case_details': skipped_cases
+            }
+        }
 
 
 def main():
