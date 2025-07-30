@@ -4,6 +4,10 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import warnings
+import logging
+import argparse
+import sys
+import traceback
 warnings.filterwarnings('ignore')
 
 # Core ML libraries
@@ -11,31 +15,44 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.ensemble import RandomForestRegressor
+
+# Gradient boosting libraries
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+    print("LightGBM not available")
+
+try:
+    import catboost as cb
+    CATBOOST_AVAILABLE = True
+except ImportError:
+    CATBOOST_AVAILABLE = False
+    print("CatBoost not available")
 import lightgbm as lgb
 import catboost as cb
 
 # Neural networks
 try:
-    import tensorflow as tf
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    from tensorflow.keras.callbacks import EarlyStopping
-    TF_AVAILABLE = True
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+    TORCH_AVAILABLE = True
 except ImportError:
-    TF_AVAILABLE = False
-    tf = None
-    print("TensorFlow not available. LSTM models will not work.")
-    from tensorflow.keras.optimizers import Adam
-except ImportError:
-    print("TensorFlow not available - LSTM models disabled")
+    TORCH_AVAILABLE = False
+    torch = None
+    print("PyTorch not available. LSTM models will not work.")
 
 # Time series
 try:
     from prophet import Prophet
+    PROPHET_AVAILABLE = True
 except ImportError:
     print("Prophet not available - Prophet models disabled")
+    PROPHET_AVAILABLE = False
 
-import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -97,40 +114,74 @@ class DataProcessor:
         return train_cases, valid_cases, test_cases
     
     def parse_weather_data(self, weather_record: Dict) -> Dict:
-        """Parse METAR-style weather data"""
-        parsed = {
-            'timestamp': pd.to_datetime(weather_record.get('date')),
-            'temperature': None,
-            'wind_speed': None,
-            'wind_direction': None,
-            'humidity': None,
-            'pressure': None
-        }
-        
-        # Parse temperature (e.g., "+0050,1" -> 5.0°C)
-        if 'tmp' in weather_record:
-            tmp_str = weather_record['tmp']
-            if tmp_str and tmp_str != '99999':
-                try:
-                    # Extract temperature value
-                    temp_val = tmp_str.split(',')[0]
-                    parsed['temperature'] = float(temp_val) / 10.0
-                except:
-                    pass
-        
-        # Parse wind (e.g., "260,1,N,0030,1" -> direction=260, speed=3.0)
-        if 'wnd' in weather_record:
-            wnd_str = weather_record['wnd']
-            if wnd_str:
-                try:
-                    parts = wnd_str.split(',')
-                    if len(parts) >= 4:
-                        parsed['wind_direction'] = float(parts[0]) if parts[0] != '999' else None
-                        parsed['wind_speed'] = float(parts[3]) / 10.0 if parts[3] != '9999' else None
-                except:
-                    pass
-        
-        return parsed
+        """Parse weather data - handles both old METAR format and new processed format"""
+        try:
+            # Get date/timestamp field - try different field names
+            date_field = weather_record.get('date') or weather_record.get('timestamp') or weather_record.get('datetime')
+            if date_field:
+                timestamp = pd.to_datetime(date_field)
+            else:
+                # If no date field found, return None to skip this record
+                return None
+                
+            parsed = {
+                'timestamp': timestamp,
+                'temperature': None,
+                'wind_speed': None,
+                'wind_direction': None,
+                'humidity': None,
+                'pressure': None
+            }
+            
+            # Check if this is the new processed format
+            if 'temp_c' in weather_record:
+                # New format - already processed
+                parsed['temperature'] = weather_record.get('temp_c')
+                parsed['wind_speed'] = weather_record.get('wind_speed_ms')
+                parsed['wind_direction'] = weather_record.get('wind_dir_deg')
+                parsed['humidity'] = weather_record.get('rel_hum')
+                parsed['pressure'] = weather_record.get('pressure_hpa')
+                
+                # Add additional engineered features directly (but avoid conflicts with temporal features)
+                for key in ['month', 'year', 'week', 'is_winter_month', 'is_rush_hour', '3_period_SMA']:
+                    if key in weather_record:
+                        parsed[f'weather_{key}'] = weather_record[key]  # Prefix to avoid conflicts
+                
+                # Handle 'hour' specially to avoid conflict with temporal features
+                if 'hour' in weather_record:
+                    parsed['weather_hour'] = weather_record['hour']
+                    
+            else:
+                # Old METAR format - keep original parsing logic
+                # Parse temperature (e.g., "+0050,1" -> 5.0°C)
+                if 'tmp' in weather_record:
+                    tmp_str = weather_record['tmp']
+                    if tmp_str and tmp_str != '99999':
+                        try:
+                            # Extract temperature value
+                            temp_val = tmp_str.split(',')[0]
+                            parsed['temperature'] = float(temp_val) / 10.0
+                        except:
+                            pass
+                
+                # Parse wind (e.g., "260,1,N,0030,1" -> direction=260, speed=3.0)
+                if 'wnd' in weather_record:
+                    wnd_str = weather_record['wnd']
+                    if wnd_str:
+                        try:
+                            parts = wnd_str.split(',')
+                            if len(parts) >= 4:
+                                parsed['wind_direction'] = float(parts[0]) if parts[0] != '999' else None
+                                parsed['wind_speed'] = float(parts[3]) / 10.0 if parts[3] != '9999' else None
+                        except:
+                            pass
+            
+            return parsed
+            
+        except Exception as e:
+            # Log the error with more detail and return None to skip this record
+            logger.error(f"Error parsing weather data: {e}")
+            return None
     
     def create_features(self, pm10_data: pd.DataFrame, weather_data: pd.DataFrame = None) -> pd.DataFrame:
         """Create features for modeling"""
@@ -162,7 +213,7 @@ class DataProcessor:
         # Hour squared for non-linear patterns
         pm10_data['hour_squared'] = pm10_data['hour'] ** 2
         
-        # # Lag features
+        # Lag features
         for lag in [1, 2, 3, 6, 12, 24, 48]:
             pm10_data[f'pm10_lag_{lag}'] = pm10_data['pm10'].shift(lag)
         
@@ -185,8 +236,16 @@ class DataProcessor:
             )
             
             # Add weather interaction features
-            pm10_data['temp_hour_interaction'] = pm10_data['temperature'] * pm10_data['hour']
-            pm10_data['wind_temp_interaction'] = pm10_data['wind_speed'] * pm10_data['temperature']
+            if 'temperature' in pm10_data.columns:
+                pm10_data['temp_hour_interaction'] = pm10_data['temperature'] * pm10_data['hour']
+                pm10_data['wind_temp_interaction'] = pm10_data['wind_speed'] * pm10_data['temperature']
+            
+            # Use additional engineered weather features if available (from new format)
+            additional_weather_features = ['weather_is_winter_month', 'weather_3_period_SMA', 'weather_year', 'weather_week', 'weather_hour']
+            for feature in additional_weather_features:
+                if feature in weather_data.columns:
+                    # These are already included from the merge, no additional processing needed
+                    pass
         
         # Fill missing values
         pm10_data = pm10_data.fillna(method='ffill').fillna(method='bfill')
@@ -216,8 +275,11 @@ class DataProcessor:
             weather_records = []
             for weather_record in case['weather']:
                 parsed_weather = self.parse_weather_data(weather_record)
-                weather_records.append(parsed_weather)
-            weather_df = pd.DataFrame(weather_records)
+                if parsed_weather is not None:  # Only add valid weather records
+                    weather_records.append(parsed_weather)
+            
+            if weather_records:  # Only create DataFrame if we have valid records
+                weather_df = pd.DataFrame(weather_records)
         
         # Create features
         features_df = self.create_features(pm10_df, weather_df)
@@ -294,6 +356,11 @@ class LightGBMForecaster(BaseForecaster):
     def train(self, X: np.ndarray, y: np.ndarray):
         """Train LightGBM model"""
         
+        if not LIGHTGBM_AVAILABLE:
+            logger.error("LightGBM not available for training")
+            self.is_trained = False
+            return
+        
         # Create dataset
         train_data = lgb.Dataset(X, label=y)
         
@@ -336,6 +403,11 @@ class CatBoostForecaster(BaseForecaster):
     
     def train(self, X: np.ndarray, y: np.ndarray):
         """Train CatBoost model"""
+        
+        if not CATBOOST_AVAILABLE:
+            logger.error("CatBoost not available for training")
+            self.is_trained = False
+            return
         
         self.model = cb.CatBoostRegressor(**self.params)
         self.model.fit(X, y)
@@ -382,10 +454,46 @@ class RandomForestForecaster(BaseForecaster):
         return self.model.predict(X)
 
 
-class LSTMForecaster(BaseForecaster):
-    """LSTM model with dropout for PM10 forecasting"""
+class LSTMModel(nn.Module):
+    """PyTorch LSTM model for PM10 forecasting"""
     
-    def __init__(self, lstm_units: int = 64, dropout_rate: float = 0.3, sequence_length: int = 24, epochs: int = 400):  # Increased epochs
+    def __init__(self, input_size: int, lstm_units: int = 64, dropout_rate: float = 0.3):
+        super(LSTMModel, self).__init__()
+        
+        self.lstm1 = nn.LSTM(input_size, lstm_units, batch_first=True, dropout=dropout_rate)
+        self.dropout1 = nn.Dropout(dropout_rate)
+        
+        self.lstm2 = nn.LSTM(lstm_units, lstm_units // 2, batch_first=True, dropout=dropout_rate)
+        self.dropout2 = nn.Dropout(dropout_rate)
+        
+        self.fc1 = nn.Linear(lstm_units // 2, 32)
+        self.relu = nn.ReLU()
+        self.dropout3 = nn.Dropout(dropout_rate / 2)
+        
+        self.fc2 = nn.Linear(32, 1)
+    
+    def forward(self, x):
+        # First LSTM layer
+        lstm_out, _ = self.lstm1(x)
+        lstm_out = self.dropout1(lstm_out)
+        
+        # Second LSTM layer
+        lstm_out, (hidden, _) = self.lstm2(lstm_out)
+        lstm_out = self.dropout2(hidden[-1])  # Use last hidden state
+        
+        # Fully connected layers
+        out = self.fc1(lstm_out)
+        out = self.relu(out)
+        out = self.dropout3(out)
+        
+        out = self.fc2(out)
+        return out
+
+
+class LSTMForecaster(BaseForecaster):
+    """PyTorch LSTM model for PM10 forecasting"""
+    
+    def __init__(self, lstm_units: int = 64, dropout_rate: float = 0.3, sequence_length: int = 24, epochs: int = 400):
         super().__init__("LSTM")
         self.lstm_units = lstm_units
         self.dropout_rate = dropout_rate
@@ -393,9 +501,10 @@ class LSTMForecaster(BaseForecaster):
         self.epochs = epochs
         self.model = None
         self.scaler = StandardScaler()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-    def fit(self, X: np.ndarray, y: np.ndarray):
-        """Train LSTM model with dropout"""
+    def train(self, X: np.ndarray, y: np.ndarray):
+        """Train PyTorch LSTM model"""
         logger.info(f"Training LSTM with {self.lstm_units} units, dropout={self.dropout_rate}")
         
         # Scale features
@@ -404,39 +513,77 @@ class LSTMForecaster(BaseForecaster):
         # Create sequences for LSTM
         X_seq, y_seq = self._create_sequences(X_scaled, y)
         
-        # Build model
-        self.model = tf.keras.Sequential([
-            tf.keras.layers.LSTM(self.lstm_units, return_sequences=True, 
-                               input_shape=(X_seq.shape[1], X_seq.shape[2])),
-            tf.keras.layers.Dropout(self.dropout_rate),
-            tf.keras.layers.LSTM(self.lstm_units // 2, return_sequences=False),
-            tf.keras.layers.Dropout(self.dropout_rate),
-            tf.keras.layers.Dense(32, activation='relu'),
-            tf.keras.layers.Dropout(self.dropout_rate / 2),
-            tf.keras.layers.Dense(1, activation='linear')
-        ])
+        if len(X_seq) == 0:
+            logger.warning("Not enough data for LSTM sequence creation, skipping LSTM training")
+            self.is_trained = False
+            return
         
-        self.model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        # Convert to PyTorch tensors
+        X_tensor = torch.FloatTensor(X_seq).to(self.device)
+        y_tensor = torch.FloatTensor(y_seq).to(self.device)
         
-        # Train model
-        early_stopping = tf.keras.callbacks.EarlyStopping(
-            monitor='val_loss', patience=20, restore_best_weights=True  # Increased patience
-        )
+        # Create dataset and dataloader
+        dataset = TensorDataset(X_tensor, y_tensor)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
         
-        history = self.model.fit(
-            X_seq, y_seq,
-            epochs=self.epochs,
-            batch_size=32,
-            validation_split=0.2,
-            callbacks=[early_stopping],
-            verbose=0
-        )
+        # Initialize model
+        self.model = LSTMModel(X_seq.shape[2], self.lstm_units, self.dropout_rate).to(self.device)
         
-        logger.info(f"LSTM training completed. Final loss: {history.history['loss'][-1]:.4f}")
+        # Loss and optimizer
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        
+        # Training loop
+        self.model.train()
+        best_loss = float('inf')
+        patience_counter = 0
+        patience = 20
+        
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+            
+            for batch_X, batch_y in dataloader:
+                optimizer.zero_grad()
+                
+                # Forward pass
+                outputs = self.model(batch_X)
+                loss = criterion(outputs.squeeze(), batch_y)
+                
+                # Backward pass
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                num_batches += 1
+            
+            avg_loss = epoch_loss / num_batches
+            
+            # Early stopping
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                patience_counter = 0
+                # Save best model state
+                best_model_state = self.model.state_dict().copy()
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= patience:
+                logger.info(f"Early stopping at epoch {epoch + 1}")
+                # Restore best model
+                self.model.load_state_dict(best_model_state)
+                break
+            
+            if (epoch + 1) % 50 == 0:
+                logger.info(f"Epoch [{epoch + 1}/{self.epochs}], Loss: {avg_loss:.4f}")
+        
+        self.model.eval()
+        self.is_trained = True
+        logger.info(f"LSTM training completed. Final loss: {best_loss:.4f}")
     
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Make predictions using trained LSTM model"""
-        if self.model is None:
+        """Make predictions using trained PyTorch LSTM model"""
+        if self.model is None or not self.is_trained:
             raise ValueError("Model not trained yet")
         
         X_scaled = self.scaler.transform(X)
@@ -448,9 +595,17 @@ class LSTMForecaster(BaseForecaster):
             # Pad with last known values
             last_seq = X_scaled[-self.sequence_length:] if len(X_scaled) >= self.sequence_length else np.pad(X_scaled, ((self.sequence_length - len(X_scaled), 0), (0, 0)), 'edge')
             X_seq = last_seq.reshape(1, self.sequence_length, X_scaled.shape[1])
-            return self.model.predict(X_seq, verbose=0).flatten()
         
-        return self.model.predict(X_seq, verbose=0).flatten()
+        # Convert to PyTorch tensor
+        X_tensor = torch.FloatTensor(X_seq).to(self.device)
+        
+        # Make predictions
+        self.model.eval()
+        with torch.no_grad():
+            predictions = self.model(X_tensor)
+            predictions = predictions.cpu().numpy().flatten()
+        
+        return predictions
     
     def _create_sequences(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Create sequences for LSTM training"""
@@ -461,6 +616,91 @@ class LSTMForecaster(BaseForecaster):
             y_seq.append(y[i])
         
         return np.array(X_seq), np.array(y_seq)
+
+
+class ProphetForecaster(BaseForecaster):
+    """Facebook Prophet model for PM10 forecasting"""
+    
+    def __init__(self, seasonality_mode: str = 'multiplicative', yearly_seasonality: bool = True, 
+                 weekly_seasonality: bool = True, daily_seasonality: bool = True):
+        super().__init__("Prophet")
+        self.seasonality_mode = seasonality_mode
+        self.yearly_seasonality = yearly_seasonality
+        self.weekly_seasonality = weekly_seasonality
+        self.daily_seasonality = daily_seasonality
+        self.model = None
+        self.feature_columns = []
+        
+    def train(self, X: np.ndarray, y: np.ndarray):
+        """Train Prophet model"""
+        if not PROPHET_AVAILABLE:
+            logger.error("Prophet not available for training")
+            self.is_trained = False
+            return
+            
+        logger.info(f"Training Prophet with seasonality_mode={self.seasonality_mode}")
+        
+        try:
+            # Prophet requires a DataFrame with 'ds' (datestamp) and 'y' (value) columns
+            # Since we don't have explicit timestamps in X, we'll create a synthetic time series
+            # This is a limitation - Prophet works best with actual time-indexed data
+            
+            # Create synthetic timestamps (assuming hourly data)
+            timestamps = pd.date_range(start='2020-01-01', periods=len(y), freq='H')
+            
+            # Prepare Prophet dataframe
+            df = pd.DataFrame({
+                'ds': timestamps,
+                'y': y
+            })
+            
+            # Initialize Prophet model
+            self.model = Prophet(
+                seasonality_mode=self.seasonality_mode,
+                yearly_seasonality=self.yearly_seasonality,
+                weekly_seasonality=self.weekly_seasonality,
+                daily_seasonality=self.daily_seasonality
+            )
+            
+            # Fit the model
+            self.model.fit(df)
+            
+            self.is_trained = True
+            logger.info("Prophet model trained successfully")
+            
+        except Exception as e:
+            logger.error(f"Prophet training failed: {e}")
+            self.is_trained = False
+    
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions using trained Prophet model"""
+        if self.model is None or not self.is_trained:
+            raise ValueError("Model not trained yet")
+        
+        try:
+            # Create future timestamps for prediction
+            # This is a simplified approach - in practice, you'd want actual future timestamps
+            future_timestamps = pd.date_range(start='2023-01-01', periods=len(X), freq='H')
+            
+            future_df = pd.DataFrame({
+                'ds': future_timestamps
+            })
+            
+            # Make predictions
+            forecast = self.model.predict(future_df)
+            
+            # Extract predictions (yhat column)
+            predictions = forecast['yhat'].values
+            
+            # Ensure non-negative predictions
+            predictions = np.maximum(predictions, 0.0)
+            
+            return predictions
+            
+        except Exception as e:
+            logger.error(f"Prophet prediction failed: {e}")
+            # Return zeros as fallback
+            return np.zeros(len(X))
 
 
 class EnsembleForecaster:
@@ -481,19 +721,33 @@ class EnsembleForecaster:
         self.scaler.fit(X)
         X_scaled = self.scaler.transform(X)
         
+        # Handle failed models more intelligently
+        failed_models = []
         for i, model in enumerate(self.models):
             logger.info(f"Training model {i+1}/{len(self.models)}: {model.model_name}")
             try:
                 model.train(X_scaled, y)
+                logger.info(f"✓ {model.model_name} trained successfully")
             except Exception as e:
-                logger.error(f"Failed to train {model.model_name}: {e}")
+                logger.error(f"✗ Failed to train {model.model_name}: {e}")
+                failed_models.append(i)
                 # Set weight to 0 for failed models
                 self.weights[i] = 0.0
         
-        # Normalize weights
+        # Normalize weights only among successful models
         total_weight = sum(self.weights)
+        logger.info(f"Weights before normalization: {self.weights}, total: {total_weight}")
+        
         if total_weight > 0:
             self.weights = [w / total_weight for w in self.weights]
+            logger.info(f"Weights after normalization: {self.weights}")
+            
+            # Show final model allocation
+            for i, (model, weight) in enumerate(zip(self.models, self.weights)):
+                if weight > 0:
+                    logger.info(f"  {model.model_name}: {weight:.3f} ({weight*100:.1f}%)")
+                else:
+                    logger.info(f"  {model.model_name}: {weight:.3f} (FAILED)")
         else:
             raise ValueError("All models failed to train")
     
@@ -589,7 +843,11 @@ class PM10ForecastingSystem:
             RandomForestForecaster()
         ]
         
-        return EnsembleForecaster(models)
+        # Give RandomForest higher weight since it performs best
+        # Weights: [LightGBM, CatBoost, RandomForest]
+        weights = [0.2, 0.2, 0.6]  # RandomForest gets 60% influence
+        
+        return EnsembleForecaster(models, weights)
     
     def train_from_historical_data(self, training_cases: List[Dict]):
         """Train models from historical data"""
@@ -641,7 +899,7 @@ class PM10ForecastingSystem:
         logger.info("Model training completed")
     
     def train_with_validation(self, training_cases: List[Dict], validation_cases: List[Dict] = None, 
-                             include_lstm: bool = True) -> Dict:
+                             include_lstm: bool = True, include_prophet: bool = False) -> Dict:
         """Train models with validation and return evaluation metrics"""
         
         # Process training data
@@ -690,13 +948,33 @@ class PM10ForecastingSystem:
             RandomForestForecaster()
         ]
         
-        # Add LSTM if TensorFlow is available and requested
-        if include_lstm and TF_AVAILABLE:
+        # Add LSTM if PyTorch is available and requested
+        if include_lstm and TORCH_AVAILABLE:
             models.append(LSTMForecaster())
             logger.info("Added LSTM model with dropout")
+            
+        # Add Prophet if available and requested
+        if include_prophet and PROPHET_AVAILABLE:
+            models.append(ProphetForecaster())
+            logger.info("Added Prophet model")
+            
+        # Set weights based on available models
+        num_models = len(models)
+        if num_models == 3:  # Base models only
+            weights = [0.1, 0.3, 0.6]  # [LightGBM, CatBoost, RandomForest]
+        elif num_models == 4:  # Base + one additional
+            weights = [0.1, 0.25, 0.5, 0.15]  # Balanced 4 models
+        elif num_models == 5:  # All models
+            weights = [0.1, 0.2, 0.4, 0.2, 0.1]  # Balanced 5 models
+        else:
+            # Fallback to equal weights
+            weights = [1.0/num_models] * num_models
         
-        self.ensemble = EnsembleForecaster(models)
+        logger.info(f"Setting ensemble weights: {weights}")
+        logger.info(f"Model names: {[model.model_name for model in models]}")
+        self.ensemble = EnsembleForecaster(models, weights)
         self.ensemble.train(X_train, y_train, feature_columns)
+        logger.info(f"Final ensemble weights after training: {self.ensemble.weights}")
         
         # Evaluate on validation data if provided
         validation_metrics = {}
@@ -969,6 +1247,7 @@ def main():
     parser.add_argument('--split-type', choices=['temporal', 'random'], default='temporal', 
                        help='Data splitting strategy for evaluation')
     parser.add_argument('--include-lstm', action='store_true', help='Include LSTM model in ensemble')
+    parser.add_argument('--include-prophet', action='store_true', help='Include Prophet model in ensemble')
     
     args = parser.parse_args()
     
@@ -1004,7 +1283,7 @@ def main():
             # Train with validation
             logger.info("Training models with validation...")
             validation_metrics = system.train_with_validation(
-                train_cases, valid_cases, include_lstm=args.include_lstm
+                train_cases, valid_cases, include_lstm=args.include_lstm, include_prophet=args.include_prophet
             )
             
             # Evaluate on test set
@@ -1057,6 +1336,7 @@ def main():
                     'timestamp': datetime.now().isoformat(),
                     'split_type': args.split_type,
                     'include_lstm': args.include_lstm,
+                    'include_prophet': args.include_prophet,
                     'total_cases': len(cases),
                     'train_cases': len(train_cases),
                     'validation_cases': len(valid_cases),
