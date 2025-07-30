@@ -252,7 +252,7 @@ class DataProcessor:
         
         return pm10_data
     
-    def prepare_case_data(self, case: Dict, min_history_hours: int = 24) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+    def prepare_case_data(self, case: Dict, min_history_hours: int = 23) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """Process single case data with station-specific handling"""
         
         # Extract PM10 data by station (keep stations separate)
