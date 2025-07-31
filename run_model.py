@@ -114,121 +114,85 @@ class DataProcessor:
         return train_cases, valid_cases, test_cases
     
     def parse_weather_data(self, weather_record: Dict) -> Dict:
-        """Parse weather data - handles both old METAR format and new processed format"""
+        """Parse pre-engineered weather data"""
         try:
-            # Get date/timestamp field - try different field names
-            date_field = weather_record.get('date') or weather_record.get('timestamp') or weather_record.get('datetime')
-            if date_field:
-                try:
-                    timestamp = pd.to_datetime(date_field, errors='coerce')
-                    if pd.isna(timestamp):
-                        return None
-                except Exception:
-                    return None
-            else:
-                # If no date field found, return None to skip this record
+            # Get timestamp from 'date' field  
+            date_field = weather_record.get('date')
+            if not date_field:
                 return None
                 
+            timestamp = pd.to_datetime(date_field, errors='coerce')
+            if pd.isna(timestamp):
+                return None
+                
+            # Use pre-engineered weather features directly
             parsed = {
                 'timestamp': timestamp,
-                'temperature': None,
-                'wind_speed': None,
-                'wind_direction': None,
-                'humidity': None,
-                'pressure': None
+                'temp_c': weather_record.get('temp_c'),
+                'wind_speed_ms': weather_record.get('wind_speed_ms'), 
+                'wind_dir_deg': weather_record.get('wind_dir_deg'),
+                'rel_hum': weather_record.get('rel_hum'),
+                'pressure_hpa': weather_record.get('pressure_hpa'),
+                # Pre-engineered temporal and categorical features
+                'month': weather_record.get('month'),
+                'year': weather_record.get('year'), 
+                'week': weather_record.get('week'),
+                'hour': weather_record.get('hour'),
+                'doy': weather_record.get('doy'),  # day of year
+                'is_winter_month': weather_record.get('is_winter_month'),
+                'is_rush_hour': weather_record.get('is_rush_hour'),
+                '3_period_SMA': weather_record.get('3_period_SMA')
             }
-            
-            # Check if this is the new processed format
-            if 'temp_c' in weather_record:
-                # New format - already processed
-                parsed['temperature'] = weather_record.get('temp_c')
-                parsed['wind_speed'] = weather_record.get('wind_speed_ms')
-                parsed['wind_direction'] = weather_record.get('wind_dir_deg')
-                parsed['humidity'] = weather_record.get('rel_hum')
-                parsed['pressure'] = weather_record.get('pressure_hpa')
-                
-                # Add additional engineered features directly (but avoid conflicts with temporal features)
-                for key in ['month', 'year', 'week', 'is_winter_month', 'is_rush_hour', '3_period_SMA']:
-                    if key in weather_record:
-                        parsed[f'weather_{key}'] = weather_record[key]  # Prefix to avoid conflicts
-                
-                # Handle 'hour' specially to avoid conflict with temporal features
-                if 'hour' in weather_record:
-                    parsed['weather_hour'] = weather_record['hour']
-                    
-            else:
-                # Old METAR format - keep original parsing logic
-                # Parse temperature (e.g., "+0050,1" -> 5.0°C)
-                if 'tmp' in weather_record:
-                    tmp_str = weather_record['tmp']
-                    if tmp_str and tmp_str != '99999':
-                        try:
-                            # Extract temperature value
-                            temp_val = tmp_str.split(',')[0]
-                            parsed['temperature'] = float(temp_val) / 10.0
-                        except:
-                            pass
-                
-                # Parse wind (e.g., "260,1,N,0030,1" -> direction=260, speed=3.0)
-                if 'wnd' in weather_record:
-                    wnd_str = weather_record['wnd']
-                    if wnd_str:
-                        try:
-                            parts = wnd_str.split(',')
-                            if len(parts) >= 4:
-                                parsed['wind_direction'] = float(parts[0]) if parts[0] != '999' else None
-                                parsed['wind_speed'] = float(parts[3]) / 10.0 if parts[3] != '9999' else None
-                        except:
-                            pass
             
             return parsed
             
-        except Exception as e:
-            # Log the error with more detail and return None to skip this record
-            logger.error(f"Error parsing weather data: {e}")
+        except Exception:
             return None
     
     def create_features(self, pm10_data: pd.DataFrame, weather_data: pd.DataFrame = None) -> pd.DataFrame:
-        """Create features for modeling"""
+        """Create features for modeling - PM10 temporal features + merge pre-engineered weather data"""
+        
+        logger.debug(f"Creating features for {len(pm10_data)} PM10 records")
         
         # Ensure timestamp is datetime
         pm10_data['timestamp'] = pd.to_datetime(pm10_data['timestamp'])
         pm10_data = pm10_data.sort_values('timestamp').reset_index(drop=True)
         
-        # Temporal features
-        pm10_data['hour'] = pm10_data['timestamp'].dt.hour
-        pm10_data['day_of_week'] = pm10_data['timestamp'].dt.dayofweek
-        pm10_data['month'] = pm10_data['timestamp'].dt.month
-        pm10_data['day_of_year'] = pm10_data['timestamp'].dt.dayofyear
+        # Create temporal features for PM10 data (prefix to avoid conflicts)
+        pm10_data['pm10_hour'] = pm10_data['timestamp'].dt.hour
+        pm10_data['pm10_day_of_week'] = pm10_data['timestamp'].dt.dayofweek
+        pm10_data['pm10_month'] = pm10_data['timestamp'].dt.month
+        pm10_data['pm10_day_of_year'] = pm10_data['timestamp'].dt.dayofyear
         
         # Cyclical encoding for temporal features
-        pm10_data['hour_sin'] = np.sin(2 * np.pi * pm10_data['hour'] / 24)
-        pm10_data['hour_cos'] = np.cos(2 * np.pi * pm10_data['hour'] / 24)
-        pm10_data['dow_sin'] = np.sin(2 * np.pi * pm10_data['day_of_week'] / 7)
-        pm10_data['dow_cos'] = np.cos(2 * np.pi * pm10_data['day_of_week'] / 7)
+        pm10_data['pm10_hour_sin'] = np.sin(2 * np.pi * pm10_data['pm10_hour'] / 24)
+        pm10_data['pm10_hour_cos'] = np.cos(2 * np.pi * pm10_data['pm10_hour'] / 24)
+        pm10_data['pm10_dow_sin'] = np.sin(2 * np.pi * pm10_data['pm10_day_of_week'] / 7)
+        pm10_data['pm10_dow_cos'] = np.cos(2 * np.pi * pm10_data['pm10_day_of_week'] / 7)
         
-        # Add more temporal patterns for better variation
-        pm10_data['is_weekend'] = (pm10_data['day_of_week'] >= 5).astype(int)
-        pm10_data['is_rush_hour'] = pm10_data['hour'].isin([7, 8, 9, 17, 18, 19]).astype(int)
-        pm10_data['is_night'] = pm10_data['hour'].isin([22, 23, 0, 1, 2, 3, 4, 5]).astype(int)
+        # Additional temporal patterns
+        pm10_data['pm10_is_weekend'] = (pm10_data['pm10_day_of_week'] >= 5).astype(int)
+        pm10_data['pm10_is_rush_hour'] = pm10_data['pm10_hour'].isin([7, 8, 9, 17, 18, 19]).astype(int)
+        pm10_data['pm10_is_night'] = pm10_data['pm10_hour'].isin([22, 23, 0, 1, 2, 3, 4, 5]).astype(int)
         
         # Season encoding
-        pm10_data['season'] = ((pm10_data['month'] % 12 + 3) // 3)
+        pm10_data['pm10_season'] = ((pm10_data['pm10_month'] % 12 + 3) // 3)
         
         # Hour squared for non-linear patterns
-        pm10_data['hour_squared'] = pm10_data['hour'] ** 2
+        pm10_data['pm10_hour_squared'] = pm10_data['pm10_hour'] ** 2
         
-        # Lag features
+        # PM10 lag features
         for lag in [1, 2, 3, 6, 12, 24, 48]:
             pm10_data[f'pm10_lag_{lag}'] = pm10_data['pm10'].shift(lag)
         
-        # Rolling statistics
+        # PM10 rolling statistics
         for window in [3, 6, 12, 24]:
             pm10_data[f'pm10_rolling_mean_{window}'] = pm10_data['pm10'].rolling(window=window).mean()
             pm10_data[f'pm10_rolling_std_{window}'] = pm10_data['pm10'].rolling(window=window).std()
         
-        # Weather features integration
+        # Merge pre-engineered weather data (if available)
         if weather_data is not None and len(weather_data) > 0:
+            # Ensure weather timestamp is datetime
             weather_data['timestamp'] = pd.to_datetime(weather_data['timestamp'])
             
             # Merge with tolerance for time matching
@@ -240,61 +204,104 @@ class DataProcessor:
                 tolerance=pd.Timedelta('2H')
             )
             
-            # Add weather interaction features
-            if 'temperature' in pm10_data.columns:
-                pm10_data['temp_hour_interaction'] = pm10_data['temperature'] * pm10_data['hour']
-                pm10_data['wind_temp_interaction'] = pm10_data['wind_speed'] * pm10_data['temperature']
-            
-            # Use additional engineered weather features if available (from new format)
-            additional_weather_features = ['weather_is_winter_month', 'weather_3_period_SMA', 'weather_year', 'weather_week', 'weather_hour']
-            for feature in additional_weather_features:
-                if feature in weather_data.columns:
-                    # These are already included from the merge, no additional processing needed
-                    pass
+            # Create interaction features using pre-engineered weather data
+            if 'temp_c' in pm10_data.columns:
+                pm10_data['temp_pm10hour_interaction'] = pm10_data['temp_c'] * pm10_data['pm10_hour']
+                if 'wind_speed_ms' in pm10_data.columns:
+                    pm10_data['wind_temp_interaction'] = pm10_data['wind_speed_ms'] * pm10_data['temp_c']
         
         # Fill missing values
-        pm10_data = pm10_data.fillna(method='ffill').fillna(method='bfill')
+        pm10_data = pm10_data.ffill().bfill()
         
+        # If still have NaN values, fill with default values
+        if pm10_data.isnull().any().any():
+            logger.debug(f"Still have NaN values after forward/backward fill, using default values")
+            pm10_data = pm10_data.fillna(0.0)
+        
+        logger.debug(f"Created features dataframe with shape {pm10_data.shape}")
         return pm10_data
     
-    def prepare_case_data(self, case: Dict, min_history_hours: int = 12) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
-        """Process single case data with station-specific handling"""
+    def prepare_case_data(self, case: Dict, min_history_hours: int = 1) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+        """Process single case data with hybrid station handling - station-specific when possible, aggregated fallback"""
         
-        # Extract PM10 data by station (keep stations separate)
-        station_data = []
         target_info = case['target']
         prediction_start = pd.to_datetime(target_info['prediction_start_time'])
+        
+        # Collect all PM10 data from all stations
+        all_pm10_records = []
+        station_data = []
+        
+        logger.debug(f"Case {case.get('case_id', 'unknown')}: Processing {len(case['stations'])} stations")
         
         for station in case['stations']:
             pm10_records = []
             for record in station['history']:
                 pm10_records.append({
                     'timestamp': record['timestamp'],
-                    'pm10': record['pm10']
+                    'pm10': record['pm10'],
+                    'station_code': station['station_code'],
+                    'latitude': station['latitude'],
+                    'longitude': station['longitude']
                 })
             
             if not pm10_records:
+                logger.debug(f"Station {station['station_code']}: No PM10 records")
                 continue
+            
+            logger.debug(f"Station {station['station_code']}: {len(pm10_records)} PM10 records")
                 
             pm10_df = pd.DataFrame(pm10_records)
             pm10_df['timestamp'] = pd.to_datetime(pm10_df['timestamp'])
             pm10_df = pm10_df.sort_values('timestamp')
             
-            # Check if we have sufficient historical data before prediction start
-            latest_data_time = pm10_df['timestamp'].max()
-            hours_of_history = (latest_data_time - pm10_df['timestamp'].min()).total_seconds() / 3600
-            gap_to_prediction = (prediction_start - latest_data_time).total_seconds() / 3600
-            
-            # Allow up to 48 hours gap to prediction (forecasting scenario)
-            max_gap_hours = 48
-            
-            if hours_of_history < min_history_hours:
-                logger.warning(f"Station {station['station_code']} in case {case.get('case_id', 'unknown')} has insufficient history: {hours_of_history:.1f} hours (need {min_history_hours})")
-                continue
+            # Process weather data
+            weather_df = None
+            if 'weather' in case and case['weather']:
+                weather_records = []
+                for weather_record in case['weather']:
+                    parsed_weather = self.parse_weather_data(weather_record)
+                    if parsed_weather is not None:
+                        weather_records.append(parsed_weather)
+                    
+                if weather_records:
+                    weather_df = pd.DataFrame(weather_records)
                 
-            if gap_to_prediction > max_gap_hours:
-                logger.warning(f"Station {station['station_code']} in case {case.get('case_id', 'unknown')} has too large gap to prediction: {gap_to_prediction:.1f} hours (max {max_gap_hours})")
-                continue
+            # Create features for this station
+            features_df = self.create_features(pm10_df.drop(['station_code', 'latitude', 'longitude'], axis=1), weather_df)
+                
+            station_info = {
+                'station_code': station['station_code'],
+                'latitude': station['latitude'],
+                'longitude': station['longitude'],
+                'features_df': features_df
+            }
+            station_data.append(station_info)
+            
+            # Add to aggregated data regardless (for fallback)
+            all_pm10_records.extend(pm10_records)
+        
+        logger.debug(f"Case {case.get('case_id', 'unknown')}: Collected {len(all_pm10_records)} total PM10 records from all stations")
+        
+        # Strategy 1: Station-specific (if we have valid stations)
+        if station_data:
+            logger.debug(f"Case {case.get('case_id', 'unknown')}: Using station-specific data from {len(station_data)} valid stations")
+            return station_data[0]['features_df'], target_info, station_data
+        
+        # Strategy 2: Aggregated fallback (when no stations have sufficient individual data)
+        if all_pm10_records:
+            logger.info(f"Case {case.get('case_id', 'unknown')}: No stations have sufficient individual data, using aggregated approach")
+            
+            # Create aggregated DataFrame
+            all_df = pd.DataFrame(all_pm10_records)
+            all_df['timestamp'] = pd.to_datetime(all_df['timestamp'])
+            
+            # Group by timestamp and average PM10 values across stations
+            aggregated_df = all_df.groupby('timestamp').agg({
+                'pm10': 'mean',  # Average PM10 across stations
+                'latitude': 'mean',  # Average coordinates
+                'longitude': 'mean'
+            }).reset_index()
+            aggregated_df = aggregated_df.sort_values('timestamp')
             
             # Process weather data
             weather_df = None
@@ -308,26 +315,26 @@ class DataProcessor:
                 if weather_records:
                     weather_df = pd.DataFrame(weather_records)
             
-            # Create features for this station
-            features_df = self.create_features(pm10_df, weather_df)
+            # Create features for aggregated data
+            features_df = self.create_features(aggregated_df.drop(['latitude', 'longitude'], axis=1), weather_df)
             
-            # Only include if we have enough valid features after processing
-            if len(features_df) > min_history_hours:
-                station_info = {
-                    'station_code': station['station_code'],
-                    'latitude': station['latitude'],
-                    'longitude': station['longitude'],
-                    'features_df': features_df
-                }
-                station_data.append(station_info)
+            # Create a single "aggregated station" entry
+            avg_lat = aggregated_df['latitude'].mean()
+            avg_lon = aggregated_df['longitude'].mean()
+            
+            aggregated_station = {
+                'station_code': 'AGGREGATED',
+                'latitude': avg_lat,
+                'longitude': avg_lon,
+                'features_df': features_df
+            }
+            
+            logger.info(f"Case {case.get('case_id', 'unknown')}: Successfully created aggregated features with {len(features_df)} records")
+            return features_df, target_info, [aggregated_station]
         
-        # Return the first valid station's data for backward compatibility with training
-        # but also return all station data for station-specific predictions
-        if station_data:
-            return station_data[0]['features_df'], target_info, station_data
-        else:
-            # No valid stations found
-            return pd.DataFrame(), target_info, []
+        # No data available
+        logger.warning(f"Case {case.get('case_id', 'unknown')}: No PM10 data available")
+        return pd.DataFrame(), target_info, []
 
 
 class BaseForecaster:
@@ -897,35 +904,53 @@ class PM10ForecastingSystem:
         
         logger.info(f"Processing {len(training_cases)} training cases")
         
-        for case in training_cases:
+        successful_cases = 0
+        failed_cases = 0
+        
+        for i, case in enumerate(training_cases):
+            if i < 10 or i % 100 == 0:  # Log first 10 cases and every 100th case
+                logger.info(f"Processing case {i+1}/{len(training_cases)}: {case.get('case_id', 'unknown')}")
+                
             try:
                 features_df, _, station_data = self.data_processor.prepare_case_data(case)
                 
                 if len(station_data) == 0:
-                    logger.warning(f"Skipping case {case.get('case_id', 'unknown')} - no valid stations")
+                    failed_cases += 1
+                    if i < 10:  # Detailed logging for first 10 cases
+                        logger.warning(f"Case {case.get('case_id', 'unknown')}: No valid stations found")
                     continue
                 
                 # Use the first valid station's data for training
                 features_df = station_data[0]['features_df']
                 
-                # Fill missing weather values with 0 or reasonable defaults
+                # Fill missing weather values with reasonable defaults
                 features_df = features_df.fillna({
-                    'humidity': 50.0,  # Default humidity
-                    'pressure': 1013.25,  # Default pressure (sea level)
-                    'temperature': 15.0,  # Default temperature
-                    'wind_speed': 5.0,  # Default wind speed
-                    'wind_direction': 180.0  # Default wind direction
+                    'rel_hum': 50.0,  # Default humidity
+                    'pressure_hpa': 1013.25,  # Default pressure (sea level)
+                    'temp_c': 15.0,  # Default temperature
+                    'wind_speed_ms': 5.0,  # Default wind speed
+                    'wind_dir_deg': 180.0  # Default wind direction
                 })
                 
                 # Only use complete records for training (after filling missing values)
                 complete_records = features_df.dropna()
                 if len(complete_records) > 0:
                     all_features.append(complete_records)
-                    logger.info(f"Added {len(complete_records)} records from case {case.get('case_id', 'unknown')}")
+                    successful_cases += 1
+                    if i < 10:  # Detailed logging for first 10 cases
+                        logger.info(f"Case {case.get('case_id', 'unknown')}: Added {len(complete_records)} records")
+                else:
+                    failed_cases += 1
+                    if i < 10:
+                        logger.warning(f"Case {case.get('case_id', 'unknown')}: No complete records after processing")
                     
             except Exception as e:
-                logger.error(f"Error processing training case: {e}")
+                failed_cases += 1
+                if i < 10:  # Detailed logging for first 10 cases
+                    logger.error(f"Case {case.get('case_id', 'unknown')}: Error processing - {e}")
                 continue
+        
+        logger.info(f"Training data collection complete: {successful_cases} successful cases, {failed_cases} failed cases")
         
         if not all_features:
             raise ValueError("No valid training data available")
@@ -967,11 +992,11 @@ class PM10ForecastingSystem:
                 
                 # Fill missing weather values with defaults
                 features_df = features_df.fillna({
-                    'humidity': 50.0,
-                    'pressure': 1013.25,
-                    'temperature': 15.0,
-                    'wind_speed': 5.0,
-                    'wind_direction': 180.0
+                    'rel_hum': 50.0,
+                    'pressure_hpa': 1013.25,
+                    'temp_c': 15.0,
+                    'wind_speed_ms': 5.0,
+                    'wind_dir_deg': 180.0
                 })
                 
                 complete_records = features_df.dropna()
@@ -1048,11 +1073,11 @@ class PM10ForecastingSystem:
                     features_df = station_data[0]['features_df']
                     
                     features_df = features_df.fillna({
-                        'humidity': 50.0,
-                        'pressure': 1013.25,
-                        'temperature': 15.0,
-                        'wind_speed': 5.0,
-                        'wind_direction': 180.0
+                        'rel_hum': 50.0,
+                        'pressure_hpa': 1013.25,
+                        'temp_c': 15.0,
+                        'wind_speed_ms': 5.0,
+                        'wind_dir_deg': 180.0
                     })
                     
                     complete_records = features_df.dropna()
@@ -1109,11 +1134,11 @@ class PM10ForecastingSystem:
                 features_df = station_data[0]['features_df']
                 
                 features_df = features_df.fillna({
-                    'humidity': 50.0,
-                    'pressure': 1013.25,
-                    'temperature': 15.0,
-                    'wind_speed': 5.0,
-                    'wind_direction': 180.0
+                    'rel_hum': 50.0,
+                    'pressure_hpa': 1013.25,
+                    'temp_c': 15.0,
+                    'wind_speed_ms': 5.0,
+                    'wind_dir_deg': 180.0
                 })
                 
                 complete_records = features_df.dropna()
@@ -1240,11 +1265,11 @@ class PM10ForecastingSystem:
             try:
                 # Fill missing weather values with defaults
                 features_df = features_df.fillna({
-                    'humidity': 50.0,
-                    'pressure': 1013.25,
-                    'temperature': 15.0,
-                    'wind_speed': 5.0,
-                    'wind_direction': 180.0
+                    'rel_hum': 50.0,
+                    'pressure_hpa': 1013.25,
+                    'temp_c': 15.0,
+                    'wind_speed_ms': 5.0,
+                    'wind_dir_deg': 180.0
                 })
                 
                 # Generate features for each of the 24 hours
