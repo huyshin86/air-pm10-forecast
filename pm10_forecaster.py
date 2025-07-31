@@ -303,24 +303,60 @@ def generate_output(data, landuse_data=None, forecast_hours=24):
               f"start: {base_forecast_start.isoformat()}")
         print(f"[DEBUG] Available stations: {len(stations)}")
 
-        # Gather history from all stations
-        all_history = []
+        # Generate forecasts for each station separately
+        station_forecasts = []
+        target_lat, target_lon = latitude, longitude
+        
         for station in stations:
             station_code = station["station_code"]
             history = station.get("history", [])
-            all_history.extend(history)
+            station_lat = station["latitude"]
+            station_lon = station["longitude"]
+            
             print(f"  [INFO] Station {station_code}: {len(history)} history points")
-
-        # Sort all history by timestamp
-        all_history.sort(key=lambda x: x['timestamp'])
-
-        # Call the prediction function with CatBoost model
-        forecast_list = predict_pm10(
-            base_time=base_forecast_start,
-            history=all_history,
-            landuse_data=case.get('weather', []),  # Pass weather data
-            hours=forecast_hours
-        )
+            
+            if len(history) < 12:  # Need minimum history for meaningful forecast
+                print(f"  [WARNING] Station {station_code}: Insufficient history, skipping")
+                continue
+            
+            # Calculate distance from station to target (simple Euclidean)
+            distance = np.sqrt((station_lat - target_lat)**2 + (station_lon - target_lon)**2)
+            
+            # Generate forecast for this specific station
+            station_forecast = predict_pm10(
+                base_time=base_forecast_start,
+                history=history,  # Use only this station's history
+                landuse_data=case.get('weather', []),
+                hours=forecast_hours
+            )
+            
+            station_forecasts.append({
+                'station_code': station_code,
+                'distance': distance,
+                'forecast': station_forecast,
+                'history_points': len(history)
+            })
+            
+            print(f"  [INFO] Station {station_code}: Distance={distance:.4f}, Generated {len(station_forecast)} forecasts")
+        
+        # Choose best station forecast (closest with sufficient data)
+        if station_forecasts:
+            # Sort by distance, then by data availability
+            station_forecasts.sort(key=lambda x: (x['distance'], -x['history_points']))
+            best_station = station_forecasts[0]
+            forecast_list = best_station['forecast']
+            
+            print(f"  [INFO] Using forecast from station {best_station['station_code']} (distance={best_station['distance']:.4f})")
+        else:
+            print(f"  [WARNING] No valid station forecasts available, using baseline")
+            # Fallback to simple baseline
+            forecast_list = []
+            for h in range(forecast_hours):
+                ts = (base_forecast_start + timedelta(hours=h)).strftime("%Y-%m-%dT%H:%MZ")
+                forecast_list.append({
+                    "timestamp": ts,
+                    "pm10_pred": 25.0  # Default baseline
+                })
 
         predictions.append({
             "case_id": case_id,
