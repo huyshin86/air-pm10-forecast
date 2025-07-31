@@ -119,7 +119,12 @@ class DataProcessor:
             # Get date/timestamp field - try different field names
             date_field = weather_record.get('date') or weather_record.get('timestamp') or weather_record.get('datetime')
             if date_field:
-                timestamp = pd.to_datetime(date_field)
+                try:
+                    timestamp = pd.to_datetime(date_field, errors='coerce')
+                    if pd.isna(timestamp):
+                        return None
+                except Exception:
+                    return None
             else:
                 # If no date field found, return None to skip this record
                 return None
@@ -252,7 +257,7 @@ class DataProcessor:
         
         return pm10_data
     
-    def prepare_case_data(self, case: Dict, min_history_hours: int = 23) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+    def prepare_case_data(self, case: Dict, min_history_hours: int = 12) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """Process single case data with station-specific handling"""
         
         # Extract PM10 data by station (keep stations separate)
