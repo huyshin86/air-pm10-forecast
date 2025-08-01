@@ -12,11 +12,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the runtime components only
-COPY run_model.py .
-COPY src/ ./src/
+COPY main.py .
+COPY models ./models/
 
 # Make sure Python can find the src module
 ENV PYTHONPATH="/app:${PYTHONPATH}"
 
 # Default command: run the forecast script
-ENTRYPOINT ["python", "run_model.py"]
+ENTRYPOINT ["python", "main.py"]
