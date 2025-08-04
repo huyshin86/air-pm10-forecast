@@ -216,3 +216,4 @@ __marimo__/
 .idea/
 .data/processed/krakow_training_data.json
 .catboost_info/
+.DS_Store
