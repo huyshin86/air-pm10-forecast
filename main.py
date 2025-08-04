@@ -1,5 +1,5 @@
 """
-pm10_forecaster.py
+main.py
 
 This script reads a JSON input file containing a list of cases and, for each case,
 generates a PM10 forecast using CatBoost model at the case's target location.
@@ -229,18 +229,40 @@ class PM10Forecaster:
         # Combine all features
         X = pd.concat(X_list, ignore_index=True)
         y = np.array(y_list)
-        
+
         # Store feature columns
         self.feature_columns = X.columns.tolist()
         
-        # Scale features
-        X_scaled = self.scaler.fit_transform(X)
+        # Separate categorical and numerical features
+        categorical_columns = ['wind_var_mode']
+        numerical_columns = [col for col in X.columns if col not in categorical_columns]
+        
+        # Scale only numerical features
+        if numerical_columns:
+            X_numerical = X[numerical_columns]
+            X_numerical_scaled = self.scaler.fit_transform(X_numerical)
+            
+            # Create scaled DataFrame
+            X_scaled_df = pd.DataFrame(X_numerical_scaled, columns=numerical_columns)
+            
+            # Add categorical features back if they exist
+            if 'wind_var_mode' in X.columns:
+                X_scaled_df['wind_var_mode'] = X['wind_var_mode'].values
+            
+            X_final = X_scaled_df
+        else:
+            # If no numerical columns, use original data
+            X_final = X
+        
+        # Define categorical feature indices for CatBoost
+        categorical_features_indices = [i for i, col in enumerate(X_final.columns) if col in categorical_columns]
         
         # Train model
-        self.model.fit(X_scaled, y)
+        self.model.fit(X_final, y, cat_features=categorical_features_indices)
         self.is_trained = True
         
         print(f"[INFO] Model trained with {len(X)} samples and {len(self.feature_columns)} features")
+        print(f"[INFO] Categorical features: {[X_final.columns[i] for i in categorical_features_indices]}")
         return True
 
     def predict_single(self, features_df):
@@ -262,16 +284,38 @@ class PM10Forecaster:
                 if col in features_df.columns:
                     prediction_features[col] = features_df[col].values[0]
                 else:
-                    prediction_features[col] = 0  # Default value for missing features
-                    
+                    # Set appropriate default values based on column type
+                    if col == 'wind_var_mode':
+                        prediction_features[col] = 'X'  # Default categorical value
+                    else:
+                        prediction_features[col] = 0  # Default numerical value
+                        
             print(f"[DEBUG] Prediction features shape: {prediction_features.shape}")
             print(f"[DEBUG] Features aligned with training columns")
             
-            # Scale features
-            X_scaled = self.scaler.transform(prediction_features)
+            # Separate categorical and numerical features for scaling
+            categorical_columns = ['wind_var_mode']
+            numerical_columns = [col for col in self.feature_columns if col not in categorical_columns]
+            
+            if numerical_columns:
+                # Scale only numerical features
+                X_numerical = prediction_features[numerical_columns]
+                X_numerical_scaled = self.scaler.transform(X_numerical)
+                
+                # Create scaled DataFrame
+                X_scaled_df = pd.DataFrame(X_numerical_scaled, columns=numerical_columns)
+                
+                # Add categorical features back if they exist
+                if 'wind_var_mode' in prediction_features.columns:
+                    X_scaled_df['wind_var_mode'] = prediction_features['wind_var_mode'].values
+                
+                X_final = X_scaled_df
+            else:
+                # If no numerical columns, use original data
+                X_final = prediction_features
             
             # Make prediction
-            prediction = self.model.predict(X_scaled)[0]
+            prediction = self.model.predict(X_final)[0]
             return max(0.0, float(prediction))  # Ensure non-negative
             
         except Exception as e:
@@ -494,6 +538,7 @@ def generate_output(data, landuse_data=None, forecast_hours=24, retrain=False):
 def main():
     parser = argparse.ArgumentParser(description="Generate PM10 forecasts using CatBoost model.")
     parser.add_argument("--data-file", required=True, help="Path to input data.json")
+    parser.add_argument("--landuse-pbf", required=False, help="Path to landuse.pbf")
     parser.add_argument("--output-file", required=True, help="Path to write output.json")
     parser.add_argument("--retrain", action="store_true", help="Force model retraining")
     args = parser.parse_args()
